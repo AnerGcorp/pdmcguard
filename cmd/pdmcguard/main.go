@@ -13,6 +13,7 @@ import (
 	"github.com/AnerGcorp/pdmcguard/internal/bootstrap"
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
 	"github.com/AnerGcorp/pdmcguard/internal/config"
+	"github.com/AnerGcorp/pdmcguard/internal/git"
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
 )
 
@@ -122,6 +123,9 @@ func runDaemon(extraRoots []string) {
 		}
 	}
 
+	// Git reader for enriching events with branch/commit metadata
+	gitReader := git.NewReader()
+
 	fmt.Println("Watching for PDMC file changes... (Ctrl+C to stop)")
 
 	// Handle signals for clean shutdown
@@ -131,7 +135,13 @@ func runDaemon(extraRoots []string) {
 	for {
 		select {
 		case ev := <-w.Events:
-			fmt.Printf("[change] %s (%s)\n", ev.Path, ev.Ecosystem)
+			info, gitErr := gitReader.Info(ev.Dir)
+			if gitErr != nil {
+				fmt.Printf("[change] %s (%s)\n", ev.Path, ev.Ecosystem)
+			} else {
+				fmt.Printf("[change] %s (%s) branch=%s commit=%.8s\n",
+					ev.Path, ev.Ecosystem, info.Branch, info.CommitSHA)
+			}
 		case err := <-w.Errors:
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		case <-sig:
