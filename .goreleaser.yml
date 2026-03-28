@@ -1,0 +1,50 @@
+# PDMCGuard — GoReleaser configuration
+# Triggered by: git tag v0.1.0 && git push --tags
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+version: 2
+
+project_name: pdmcguard
+
+builds:
+  - id: pdmcguard
+    main: ./cmd/pdmcguard
+    binary: pdmcguard
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: AnerGcorp
+    name: pdmcguard
+  draft: false
+  prerelease: auto
