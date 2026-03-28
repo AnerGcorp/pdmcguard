@@ -55,12 +55,11 @@ func main() {
 			os.Exit(1)
 
 		case "pre-check":
-			fmt.Println("pdmcguard pre-check — not yet implemented (Step 2.3)")
-			os.Exit(1)
+			os.Exit(cmdPreCheck())
 
-		case "hook-notify":
-			fmt.Println("pdmcguard hook-notify — not yet implemented (Step 2.3)")
-			os.Exit(1)
+		case "hook-init":
+			cmdHookInit(filteredArgs[1:])
+			return
 
 		case "help", "--help", "-h":
 			printUsage()
@@ -157,7 +156,7 @@ Usage:
   pdmcguard install         Install daemon, shell hooks, and system service
   pdmcguard uninstall       Remove system service and shell hooks
   pdmcguard pre-check       Check current project for critical advisories (used by shell hook)
-  pdmcguard hook-notify     Notify daemon of PDMC file change (used by shell hook)
+  pdmcguard hook-init       Output shell hook snippet (eval "$(pdmcguard hook-init)")
   pdmcguard version         Print version information
 
 Flags:
