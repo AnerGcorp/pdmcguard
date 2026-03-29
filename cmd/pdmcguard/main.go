@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/AnerGcorp/pdmcguard/internal/config"
 	"github.com/AnerGcorp/pdmcguard/internal/daemon"
 	"github.com/AnerGcorp/pdmcguard/internal/git"
+	"github.com/AnerGcorp/pdmcguard/internal/notify"
 	"github.com/AnerGcorp/pdmcguard/internal/sync"
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
 )
@@ -148,6 +150,18 @@ func runDaemon(extraRoots []string) {
 	}
 	defer syncEngine.Close()
 
+	// Start SSE listener for desktop notifications (if online)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if syncEngine.Online() {
+		creds, credErr := sync.LoadCredentials()
+		if credErr == nil {
+			sseListener := notify.NewSSEListener(creds.APIURL, creds.AccessToken)
+			go sseListener.Run(ctx)
+		}
+	}
+
 	fmt.Println("Watching for PDMC file changes... (Ctrl+C to stop)")
 
 	// Handle signals for clean shutdown
@@ -171,6 +185,7 @@ func runDaemon(extraRoots []string) {
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		case <-sig:
 			fmt.Println("\nShutting down...")
+			cancel() // Stop SSE listener
 			return
 		}
 	}
