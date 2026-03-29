@@ -1,0 +1,18 @@
+{
+    "packages": [
+        {
+            "name": "laravel/framework",
+            "version": "v11.0.0"
+        },
+        {
+            "name": "symfony/console",
+            "version": "v7.0.4"
+        }
+    ],
+    "packages-dev": [
+        {
+            "name": "phpunit/phpunit",
+            "version": "v11.0.3"
+        }
+    ]
+}

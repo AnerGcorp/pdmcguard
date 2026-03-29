@@ -11,9 +11,11 @@ import (
 	"syscall"
 
 	"github.com/AnerGcorp/pdmcguard/internal/bootstrap"
+	"github.com/AnerGcorp/pdmcguard/internal/cache"
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
 	"github.com/AnerGcorp/pdmcguard/internal/config"
 	"github.com/AnerGcorp/pdmcguard/internal/git"
+	"github.com/AnerGcorp/pdmcguard/internal/sync"
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
 )
 
@@ -126,6 +128,21 @@ func runDaemon(extraRoots []string) {
 	// Git reader for enriching events with branch/commit metadata
 	gitReader := git.NewReader()
 
+	// Open cache and sync engine
+	cacheStore, err := cache.Open(config.FilePath("cache.db"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: open cache: %v\n", err)
+		os.Exit(1)
+	}
+	defer cacheStore.Close()
+
+	syncEngine, err := sync.New(cacheStore)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: init sync engine: %v\n", err)
+		os.Exit(1)
+	}
+	defer syncEngine.Close()
+
 	fmt.Println("Watching for PDMC file changes... (Ctrl+C to stop)")
 
 	// Handle signals for clean shutdown
@@ -136,12 +153,15 @@ func runDaemon(extraRoots []string) {
 		select {
 		case ev := <-w.Events:
 			info, gitErr := gitReader.Info(ev.Dir)
-			if gitErr != nil {
-				fmt.Printf("[change] %s (%s)\n", ev.Path, ev.Ecosystem)
-			} else {
+			var gitInfo *git.Info
+			if gitErr == nil {
+				gitInfo = &info
 				fmt.Printf("[change] %s (%s) branch=%s commit=%.8s\n",
 					ev.Path, ev.Ecosystem, info.Branch, info.CommitSHA)
+			} else {
+				fmt.Printf("[change] %s (%s)\n", ev.Path, ev.Ecosystem)
 			}
+			syncEngine.HandleChange(ev, gitInfo, "watcher")
 		case err := <-w.Errors:
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		case <-sig:

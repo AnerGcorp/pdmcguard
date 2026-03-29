@@ -1,0 +1,8 @@
+# This is a comment
+requests==2.31.0
+flask==3.0.0 ; python_version >= "3.8"
+-r base.txt
+# Another comment
+numpy==1.26.4
+https://example.com/package.whl
+django==5.0.1 # inline comment
