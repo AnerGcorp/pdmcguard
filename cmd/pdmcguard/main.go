@@ -14,6 +14,7 @@ import (
 	"github.com/AnerGcorp/pdmcguard/internal/cache"
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
 	"github.com/AnerGcorp/pdmcguard/internal/config"
+	"github.com/AnerGcorp/pdmcguard/internal/daemon"
 	"github.com/AnerGcorp/pdmcguard/internal/git"
 	"github.com/AnerGcorp/pdmcguard/internal/sync"
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
@@ -50,12 +51,16 @@ func main() {
 			return
 
 		case "install":
-			fmt.Println("pdmcguard install — not yet implemented (Step 2.6)")
-			os.Exit(1)
+			cmdInstall(filteredArgs[1:])
+			return
 
 		case "uninstall":
-			fmt.Println("pdmcguard uninstall — not yet implemented (Step 2.6)")
-			os.Exit(1)
+			cmdUninstall(filteredArgs[1:])
+			return
+
+		case "login":
+			cmdLogin(filteredArgs[1:])
+			return
 
 		case "pre-check":
 			os.Exit(cmdPreCheck())
@@ -174,7 +179,46 @@ func runDaemon(extraRoots []string) {
 func cmdStatus() {
 	fmt.Printf("pdmcguard %s\n", version)
 	fmt.Printf("Config dir:  %s\n", config.Dir())
-	fmt.Println("Status:      not running (daemon not yet implemented)")
+
+	// Check service status
+	svc := daemon.NewServiceManager()
+	if svc.IsInstalled() {
+		fmt.Println("Service:     installed")
+	} else {
+		fmt.Println("Service:     not installed (run 'pdmcguard install')")
+	}
+
+	// Check credentials
+	_, credErr := sync.LoadCredentials()
+	if credErr != nil {
+		fmt.Println("Sync mode:   offline (run 'pdmcguard login')")
+	} else {
+		fmt.Println("Sync mode:   online")
+	}
+
+	// Show cache info
+	cacheStore, err := cache.Open(config.FilePath("cache.db"))
+	if err == nil {
+		defer cacheStore.Close()
+		lastSync, _ := cacheStore.GetMeta("last_full_sync")
+		if lastSync != "" {
+			fmt.Printf("Last sync:   %s\n", lastSync)
+		} else {
+			fmt.Println("Last sync:   never")
+		}
+	}
+
+	// Show queue depth
+	q, err := sync.OpenQueue(config.FilePath("queue.db"))
+	if err == nil {
+		defer q.Close()
+		n, _ := q.Len()
+		if n > 0 {
+			fmt.Printf("Queue:       %d pending items\n", n)
+		} else {
+			fmt.Println("Queue:       empty")
+		}
+	}
 }
 
 func printUsage() {
@@ -182,9 +226,10 @@ func printUsage() {
 
 Usage:
   pdmcguard [--root DIR]    Run as background daemon
-  pdmcguard status          Show daemon status and tracked projects
   pdmcguard install         Install daemon, shell hooks, and system service
-  pdmcguard uninstall       Remove system service and shell hooks
+  pdmcguard uninstall       Remove system service and shell hooks (--purge to remove data)
+  pdmcguard login           Authenticate with PDMCGuard cloud (--api-url for self-hosted)
+  pdmcguard status          Show daemon status, sync mode, and queue depth
   pdmcguard pre-check       Check current project for critical advisories (used by shell hook)
   pdmcguard hook-init       Output shell hook snippet (eval "$(pdmcguard hook-init)")
   pdmcguard version         Print version information
