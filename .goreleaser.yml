@@ -42,21 +42,6 @@ changelog:
       - "^ci:"
       - "^chore:"
 
-brews:
-  - name: pdmcguard
-    repository:
-      owner: AnerGcorp
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
-    skip_upload: "{{ if .Env.HOMEBREW_TAP_TOKEN }}false{{ else }}true{{ end }}"
-    homepage: "https://pdmcguard.com"
-    description: "Passive Dependency Monitor & Critical Guard — supply chain security for local development"
-    license: "AGPL-3.0-or-later"
-    install: |
-      bin.install "pdmcguard"
-    test: |
-      system "#{bin}/pdmcguard", "version"
-
 release:
   github:
     owner: AnerGcorp
