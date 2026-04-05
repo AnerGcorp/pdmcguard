@@ -1,4 +1,4 @@
-// PDMCGuard — Passive Dependency Monitor & Critical Guard
+// PDMCGuard — Passive Dependency Monitor & Compromise Guard
 // Copyright (C) 2026 AnerGcorp
 // SPDX-License-Identifier: AGPL-3.0-or-later
 

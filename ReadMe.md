@@ -5,7 +5,7 @@
 <h1 align="center">PDMCGuard</h1>
 
 <p align="center">
-  <strong>Passive Dependency Monitor & Critical Guard</strong><br>
+  <strong>Passive Dependency Monitor & Compromise Guard</strong><br>
   Supply chain security for local development.
 </p>
 

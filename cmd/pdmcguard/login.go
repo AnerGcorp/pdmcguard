@@ -1,4 +1,4 @@
-// PDMCGuard — Passive Dependency Monitor & Critical Guard
+// PDMCGuard — Passive Dependency Monitor & Compromise Guard
 // Copyright (C) 2026 AnerGcorp
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
@@ -32,9 +32,9 @@ func cmdLogin(args []string) {
 
 	fmt.Println("PDMCGuard Login")
 	fmt.Println()
-	fmt.Printf("API: %s\n", apiURL)
+	fmt.Println("  Get your API token at: https://pdmcguard.com/settings/api-tokens")
 	fmt.Println()
-	fmt.Print("Enter your API key (from your PDMCGuard dashboard): ")
+	fmt.Print("Enter your API token: ")
 
 	reader := bufio.NewReader(os.Stdin)
 	token, err := reader.ReadString('\n')

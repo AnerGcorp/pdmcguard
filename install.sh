@@ -109,12 +109,16 @@ install() {
 print_success() {
   printf "\n"
   printf "${BOLD}${GREEN}"
-  printf "  ╔══════════════════════════════════════════╗\n"
-  printf "  ║                                          ║\n"
-  printf "  ║   PDMCGuard %s installed!          ║\n" "$VERSION"
-  printf "  ║                                          ║\n"
-  printf "  ╚══════════════════════════════════════════╝\n"
-  printf "${RESET}\n"
+  printf "  ██████╗ ██████╗ ███╗   ███╗ ██████╗\n"
+  printf "  ██╔══██╗██╔══██╗████╗ ████║██╔════╝\n"
+  printf "  ██████╔╝██║  ██║██╔████╔██║██║\n"
+  printf "  ██╔═══╝ ██║  ██║██║╚██╔╝██║██║\n"
+  printf "  ██║     ██████╔╝██║ ╚═╝ ██║╚██████╗\n"
+  printf "  ╚═╝     ╚═════╝ ╚═╝     ╚═╝ ╚═════╝\n"
+  printf "${RESET}"
+  printf "  ${BOLD}G  U  A  R  D${RESET}  ·  ${GREEN}%s${RESET}  ·  daemon\n" "$VERSION"
+  printf "  supply chain security for developers\n"
+  printf "\n"
   printf "  ${CYAN}Next steps:${RESET}\n"
   printf "\n"
   printf "  1. Authenticate with your dashboard:\n"
@@ -134,7 +138,7 @@ print_success() {
 # ── Main ─────────────────────────────────────────────────────
 main() {
   printf "\n${BOLD}PDMCGuard Installer${RESET}\n"
-  printf "Passive Dependency Monitor & Critical Guard\n\n"
+  printf "Passive Dependency Monitor & Compromise Guard\n\n"
 
   detect_platform
   get_latest_version
