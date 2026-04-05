@@ -44,12 +44,6 @@ Install a single binary. Forget about it.
 curl -sSL https://pdmcguard.com/install.sh | sh
 ```
 
-Or with Homebrew:
-
-```sh
-brew install AnerGcorp/tap/pdmcguard
-```
-
 The daemon registers itself as a system service and runs silently in the
 background. It watches your project directories using native OS APIs and
 intercepts package manager commands via a shell hook — before they run.
@@ -114,12 +108,6 @@ Windows support is planned for a future release.
 
 ```sh
 curl -sSL https://pdmcguard.com/install.sh | sh
-```
-
-**Homebrew (macOS):**
-
-```sh
-brew install AnerGcorp/tap/pdmcguard
 ```
 
 **Manual:**
