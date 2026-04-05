@@ -46,7 +46,7 @@ type SSEListener struct {
 }
 
 // NewSSEListener creates a new SSE listener.
-// apiURL is the base API URL (e.g. "https://ouxnnyjpigtcwzgemgxg.supabase.co/functions/v1/daemon-api").
+// apiURL is the base API URL (e.g. "https://api.pdmcguard.com/v1").
 // The SSE endpoint is derived as the sibling function: replace /daemon-api path
 // with /daemon-sse in the Supabase functions URL.
 func NewSSEListener(apiURL, authToken string) *SSEListener {
