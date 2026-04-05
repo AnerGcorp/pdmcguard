@@ -15,7 +15,7 @@ import (
 	psync "github.com/AnerGcorp/pdmcguard/internal/sync"
 )
 
-const defaultAPIURL = "https://api.pdmcguard.com/v1"
+const defaultAPIURL = "https://ouxnnyjpigtcwzgemgxg.supabase.co/functions/v1/daemon-api"
 
 func cmdLogin(args []string) {
 	apiURL := defaultAPIURL

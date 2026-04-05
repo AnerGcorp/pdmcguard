@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultAPIURL   = "https://api.pdmcguard.com/v1"
+	defaultAPIURL   = "https://ouxnnyjpigtcwzgemgxg.supabase.co/functions/v1/daemon-api"
 	credentialsFile = "credentials.json"
 )
 
