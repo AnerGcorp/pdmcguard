@@ -17,7 +17,7 @@ import (
 )
 
 // Directories to skip when scanning $HOME (first-level children only).
-// These are heavy or irrelevant for project discovery.
+// These are heavy, irrelevant, or contain false-positive lock files.
 var skipDirs = map[string]bool{
 	// macOS system directories
 	"Library":      true,
@@ -26,6 +26,12 @@ var skipDirs = map[string]bool{
 	"Music":        true,
 	"Pictures":     true,
 	"Public":       true,
+	// Standard user directories (mixed content, not project roots)
+	"Desktop":   true,
+	"Documents": true,
+	"Downloads": true,
+	// Go toolchain artifacts (~/go/pkg/)
+	"go": true,
 	// Linux system directories
 	"snap": true,
 }
