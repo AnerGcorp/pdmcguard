@@ -161,6 +161,11 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Background reconnect-and-drain loop. Picks up mid-session `pdmcguard
+	// login` within ~reconnectInterval and retries the API after transient
+	// failures so offline-queued work doesn't wait for a process restart.
+	syncEngine.Start(ctx)
+
 	if syncEngine.Online() {
 		creds, credErr := sync.LoadCredentials()
 		if credErr == nil {

@@ -6,6 +6,7 @@
 package sync
 
 import (
+	"context"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -21,14 +22,24 @@ import (
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
 )
 
+// reconnectInterval is how often Start's background loop retries a reconnect
+// when offline and probes the queue for drain opportunities when online. 60s
+// trades off responsiveness to `pdmcguard login` (users wait up to a minute
+// before queued work starts flowing) against idle cost on a quiet daemon.
+const reconnectInterval = 60 * time.Second
+
 // Engine bridges the local daemon with the remote PDMCGuard API.
 type Engine struct {
 	client    *Client
 	cache     *cache.Store
 	queue     *Queue
 	machineID string
-	online    bool
-	mu        gosync.Mutex
+	// hostname and osName are captured once at construction so tryReconnect
+	// can call RegisterMachine without recomputing them on every attempt.
+	hostname string
+	osName   string
+	online   bool
+	mu       gosync.Mutex
 }
 
 // New creates a sync engine. It tries to load credentials and connect.
@@ -41,8 +52,10 @@ func New(cacheStore *cache.Store) (*Engine, error) {
 	}
 
 	e := &Engine{
-		cache: cacheStore,
-		queue: q,
+		cache:    cacheStore,
+		queue:    q,
+		hostname: MachineHostname(),
+		osName:   MachineOS(),
 	}
 
 	creds, err := LoadCredentials()
@@ -59,8 +72,8 @@ func New(cacheStore *cache.Store) (*Engine, error) {
 	// Register machine
 	mid, err := e.client.RegisterMachine(MachineReq{
 		MachineUUID: MachineUUID(),
-		Hostname:    MachineHostname(),
-		OS:          MachineOS(),
+		Hostname:    e.hostname,
+		OS:          e.osName,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sync] API unreachable — running offline (%v)\n", err)
@@ -155,6 +168,98 @@ func (e *Engine) BaselineScan(dirs []string, gitReader *git.Reader) BaselineStat
 	e.updateAlertSentinel()
 
 	return stats
+}
+
+// Start begins the background reconnect-and-drain loop. Cancel the context
+// to stop it. Safe to call at most once per Engine; calling before entering
+// the event loop is sufficient to recover from:
+//
+//   - Daemon started offline (no credentials) and `pdmcguard login` arrives
+//     mid-session — tick() re-reads credentials.json every interval and
+//     transitions to online on the first success.
+//   - Online → transient API error → offline. handleOffline flips
+//     e.online=false and without this loop no code path ever flipped it
+//     back. tick() re-probes the API and resumes drain.
+func (e *Engine) Start(ctx context.Context) {
+	go e.reconnectLoop(ctx)
+}
+
+func (e *Engine) reconnectLoop(ctx context.Context) {
+	t := time.NewTicker(reconnectInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			e.tick()
+		}
+	}
+}
+
+// tick is one iteration of the reconnect loop. Factored out so tests can
+// exercise it directly without juggling a real time.Ticker.
+func (e *Engine) tick() {
+	if !e.Online() {
+		if !e.tryReconnect() {
+			return
+		}
+	}
+	// Online (possibly just transitioned). Drain opportunistically so
+	// anything queued during the offline window — including items that
+	// the initial sync.New drain re-enqueued on a transient failure —
+	// flows through on the next tick instead of waiting for the next
+	// watcher event.
+	if n, _ := e.queue.Len(); n > 0 {
+		e.drainQueue()
+	}
+}
+
+// tryReconnect attempts the offline → online transition. Returns true only
+// on a successful transition so the caller can decide whether to drain.
+//
+// Re-reads credentials.json on every call: `pdmcguard login` writes this
+// file but can't signal the running daemon, so polling is how we notice.
+// Also re-builds the Client so a self-hosted user's `login --api-url X`
+// picks up mid-session.
+//
+// Mutex discipline: lock is held only for the initial state check and the
+// final commit. Network calls (Healthcheck, RegisterMachine) run off-lock
+// so HandleChange isn't blocked while we probe a possibly-slow API.
+func (e *Engine) tryReconnect() bool {
+	e.mu.Lock()
+	if e.online {
+		e.mu.Unlock()
+		return false
+	}
+	e.mu.Unlock()
+
+	creds, err := LoadCredentials()
+	if err != nil {
+		return false
+	}
+
+	client := NewClient(creds.APIURL, creds.AccessToken)
+	if err := client.Healthcheck(); err != nil {
+		return false
+	}
+	mid, err := client.RegisterMachine(MachineReq{
+		MachineUUID: MachineUUID(),
+		Hostname:    e.hostname,
+		OS:          e.osName,
+	})
+	if err != nil {
+		return false
+	}
+
+	e.mu.Lock()
+	e.client = client
+	e.machineID = mid
+	e.online = true
+	e.mu.Unlock()
+
+	fmt.Fprintf(os.Stderr, "[sync] reconnected to %s (machine: %.8s)\n", creds.APIURL, mid)
+	return true
 }
 
 // HandleChange processes a PDMC file change event.
@@ -297,6 +402,17 @@ func (e *Engine) syncProject(projectDir, lockPath, ecosystem, branch, commit, re
 	}
 	fmt.Fprintf(os.Stderr, "[sync] %s → %d pkgs, %d alerts\n",
 		filepath.Base(lockPath), len(pkgs), alertCount)
+
+	// A successful roundtrip is proof the API is reachable — flip online
+	// back on so subsequent HandleChange calls skip the queue short-circuit.
+	// Mirrors handleOffline's unlocked write (both happen under the
+	// HandleChange lock when called from the watcher path; the drainQueue
+	// path intentionally runs lock-free and both sides race on this single
+	// bool, matching pre-existing behavior).
+	if !e.online {
+		fmt.Fprintln(os.Stderr, "[sync] reconnected")
+	}
+	e.online = true
 }
 
 func (e *Engine) handleOffline(projectDir, lockPath, ecosystem, branch, commit string, err error) {

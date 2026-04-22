@@ -5,11 +5,16 @@
 package sync
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/AnerGcorp/pdmcguard/internal/cache"
+	"github.com/AnerGcorp/pdmcguard/internal/config"
+	"github.com/AnerGcorp/pdmcguard/internal/lockfile"
 )
 
 func TestResolveLockPathLockFile(t *testing.T) {
@@ -303,5 +308,150 @@ func TestBaselineScan_ReconcilesSentinel(t *testing.T) {
 
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Errorf("sentinel not written after BaselineScan: %v", err)
+	}
+}
+
+// ── Stage 4: reconnect-drain loop ───────────────────────────────────────────
+
+// fakeAPIServer returns an httptest.Server that answers every endpoint the
+// Engine calls during a full reconnect + drain cycle:
+//
+//	GET  /health             → 200 {"ok":true}
+//	POST /machines           → 200 {"id":"test-machine"}
+//	PUT  /projects           → 200 {"id":"test-project"}
+//	POST /snapshots          → 200 {"id":"test-snap"}
+//	POST /advisories/match   → 200 {"advisories":[]}
+//
+// Enough for tryReconnect + syncProject to succeed end-to-end without a real
+// network.
+func fakeAPIServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		switch r.URL.Path {
+		case "/health":
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case "/machines":
+			_ = json.NewEncoder(w).Encode(IDResp{ID: "test-machine"})
+		case "/projects":
+			_ = json.NewEncoder(w).Encode(IDResp{ID: "test-project"})
+		case "/snapshots":
+			_ = json.NewEncoder(w).Encode(IDResp{ID: "test-snap"})
+		case "/advisories/match":
+			_ = json.NewEncoder(w).Encode(MatchResp{})
+		default:
+			t.Logf("fakeAPIServer: unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// writeCredentials drops a credentials.json into $HOME/.pdmcguard. Caller
+// must have already pointed $HOME at a temp dir via t.Setenv.
+func writeCredentials(t *testing.T, apiURL string) {
+	t.Helper()
+	dir := config.Dir() // creates $HOME/.pdmcguard if missing
+	path := filepath.Join(dir, "credentials.json")
+	body := `{"api_url":"` + apiURL + `","access_token":"test-token"}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTick_OfflineNoCredsStaysOffline pins the no-op branch: with no
+// credentials on disk, tick() must return quickly, leave online=false, and
+// not touch the queue. Guards against regressions that e.g. crash on a nil
+// client when the reconnect path is taken optimistically.
+func TestTick_OfflineNoCredsStaysOffline(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	e := newTestEngine(t)
+
+	// Seed a queue item so we can prove tick() didn't drain it.
+	if err := e.queue.Enqueue(QueueItem{
+		ProjectDir: "/tmp/x",
+		LockPath:   "/tmp/x/go.sum",
+		Ecosystem:  "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.tick()
+
+	if e.online {
+		t.Error("online = true, want false (no credentials)")
+	}
+	if n, _ := e.queue.Len(); n != 1 {
+		t.Errorf("queue depth = %d, want 1 (drain should not have run)", n)
+	}
+}
+
+// TestTick_ReconnectsAndDrains is the headline Stage 4 test: engine starts
+// offline with a queued item, credentials appear + the API is reachable,
+// one tick() should (a) transition online and (b) drain the backlog.
+func TestTick_ReconnectsAndDrains(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	srv := fakeAPIServer(t)
+	writeCredentials(t, srv.URL)
+
+	e := newTestEngine(t)
+	e.hostname = "testhost"
+	e.osName = "testos"
+
+	// Queue a real go.sum so drainQueue → syncProject parses something and
+	// actually hits the API (not a dedup short-circuit).
+	projDir := t.TempDir()
+	goSumPath := filepath.Join(projDir, "go.sum")
+	const goSum = "github.com/example/foo v1.0.0 h1:abc=\n" +
+		"github.com/example/foo v1.0.0/go.mod h1:abc=\n"
+	if err := os.WriteFile(goSumPath, []byte(goSum), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.queue.Enqueue(QueueItem{
+		ProjectDir: projDir,
+		LockPath:   goSumPath,
+		Ecosystem:  "go",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	e.tick()
+
+	if !e.online {
+		t.Fatal("online = false after successful tick, want true")
+	}
+	if n, _ := e.queue.Len(); n != 0 {
+		t.Errorf("queue depth = %d, want 0 (drain should have cleared it)", n)
+	}
+}
+
+// TestSyncProject_ResetsOnlineOnSuccess guards the latent-bug fix adjacent
+// to Stage 4: a successful syncProject must flip online=true even when the
+// caller (e.g. the initial sync.New drainQueue goroutine, or a
+// BaselineScan pass) entered with online=false. Without this, the engine
+// would depend entirely on the tick loop to notice it's back online, which
+// would leak through whenever a watcher event beats the 60s ticker.
+func TestSyncProject_ResetsOnlineOnSuccess(t *testing.T) {
+	srv := fakeAPIServer(t)
+
+	e := newTestEngine(t)
+	e.client = NewClient(srv.URL, "test-token")
+	e.machineID = "test-machine"
+	e.hostname = "testhost"
+	e.osName = "testos"
+	// online is already false from newTestEngine.
+
+	projDir := t.TempDir()
+	lockPath := filepath.Join(projDir, "go.sum")
+	if err := os.WriteFile(lockPath, []byte("stub"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pkgs := []lockfile.Package{{Name: "demo", Version: "1.0.0"}}
+
+	e.syncProject(projDir, lockPath, "go", "", "", "", "deadbeef", pkgs, "baseline")
+
+	if !e.online {
+		t.Error("online = false after successful syncProject, want true")
 	}
 }
