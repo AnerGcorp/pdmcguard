@@ -7,6 +7,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/AnerGcorp/pdmcguard/internal/config"
 	"github.com/AnerGcorp/pdmcguard/internal/daemon"
@@ -46,7 +47,21 @@ func cmdUninstall(args []string) {
 		fmt.Printf("  Shell hook removed from %s\n", daemon.ShellRCPath(shell))
 	}
 
-	// 3. Optionally purge config directory
+	// 3. Remove the copied binary regardless of --purge. It's an install
+	// artifact (put there by cmdInstall), not user data — nothing should
+	// invoke it once the service and shell hook are gone. Leaving it
+	// behind means a later `pdmcguard install` from a new checkout races
+	// against a stale binary, and users who "uninstalled" are surprised
+	// to still see the file.
+	binDir := filepath.Join(config.Dir(), "bin")
+	if err := os.RemoveAll(binDir); err != nil {
+		fmt.Fprintf(os.Stderr, "  warning: failed to remove %s: %v\n", binDir, err)
+	} else {
+		fmt.Printf("  Binary removed: %s\n", binDir)
+	}
+
+	// 4. Optionally purge the rest of the config directory (user data:
+	// credentials.json, cache.db, queue.db, machine_id, logs).
 	if purge {
 		dir := config.Dir()
 		if err := os.RemoveAll(dir); err != nil {
