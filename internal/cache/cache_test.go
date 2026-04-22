@@ -619,3 +619,95 @@ func TestMigration_LastShownAtColumnAdded(t *testing.T) {
 		t.Errorf("expected 1 pre-existing alert post-migration, got %d", len(alerts))
 	}
 }
+
+// TestClearProjectAcks_RemovesScopedRows verifies the per-project ack
+// cleanup used by `pdmcguard exclude`: only rows for the given
+// project_dir vanish. Per-project acks for other projects survive.
+func TestClearProjectAcks_RemovesScopedRows(t *testing.T) {
+	store := openTestStore(t)
+
+	if err := store.Ack("/proj/a", "GHSA-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ack("/proj/a", "GHSA-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ack("/proj/b", "GHSA-3"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ClearProjectAcks("/proj/a"); err != nil {
+		t.Fatalf("ClearProjectAcks: %v", err)
+	}
+
+	acks, _ := store.ListAcks()
+	if len(acks) != 1 {
+		t.Fatalf("expected 1 ack surviving, got %d: %+v", len(acks), acks)
+	}
+	if acks[0].ProjectDir != "/proj/b" || acks[0].AdvisoryID != "GHSA-3" {
+		t.Errorf("wrong ack survived: %+v", acks[0])
+	}
+}
+
+// TestClearProjectAcks_LeavesGlobalAckIntact is the correctness guard
+// for the "*" sentinel: a user's global ack must survive a per-project
+// exclude-driven cleanup. Otherwise excluding one monorepo subtree
+// would accidentally silence the user's intent to dismiss the advisory
+// everywhere else.
+func TestClearProjectAcks_LeavesGlobalAckIntact(t *testing.T) {
+	store := openTestStore(t)
+
+	if err := store.Ack(GlobalAckScope, "GHSA-global"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ack("/proj/a", "GHSA-local"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.ClearProjectAcks("/proj/a"); err != nil {
+		t.Fatal(err)
+	}
+
+	acks, _ := store.ListAcks()
+	var sawGlobal bool
+	for _, a := range acks {
+		if a.ProjectDir == GlobalAckScope && a.AdvisoryID == "GHSA-global" {
+			sawGlobal = true
+		}
+		if a.ProjectDir == "/proj/a" {
+			t.Errorf("per-project ack should be gone, still saw %+v", a)
+		}
+	}
+	if !sawGlobal {
+		t.Error("global ack was wiped by per-project ClearProjectAcks")
+	}
+}
+
+// TestListProjectDirs_Distinct verifies the helper returns each
+// project_dir once even when multiple advisories are active for it
+// (the common case) and in deterministic order.
+func TestListProjectDirs_Distinct(t *testing.T) {
+	store := openTestStore(t)
+
+	seed := []ProjectAlert{
+		{ProjectDir: "/proj/b", AdvisoryID: "A1", PackageName: "p", Ecosystem: "npm", Severity: "critical"},
+		{ProjectDir: "/proj/b", AdvisoryID: "A2", PackageName: "p", Ecosystem: "npm", Severity: "critical"},
+		{ProjectDir: "/proj/a", AdvisoryID: "A3", PackageName: "p", Ecosystem: "npm", Severity: "critical"},
+	}
+	for _, s := range seed {
+		if err := store.UpsertProjectAlert(s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dirs, err := store.ListProjectDirs()
+	if err != nil {
+		t.Fatalf("ListProjectDirs: %v", err)
+	}
+	if len(dirs) != 2 {
+		t.Fatalf("expected 2 distinct dirs, got %d: %v", len(dirs), dirs)
+	}
+	if dirs[0] != "/proj/a" || dirs[1] != "/proj/b" {
+		t.Errorf("expected sorted order, got %v", dirs)
+	}
+}

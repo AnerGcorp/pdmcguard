@@ -276,6 +276,44 @@ func (s *Store) ClearProjectAlerts(projectDir string) error {
 	return err
 }
 
+// ClearProjectAcks removes every ack row for projectDir. Companion to
+// ClearProjectAlerts — called when we stop tracking a project (e.g. the
+// user ran `pdmcguard exclude`) so the ack table doesn't accumulate
+// tombstones for paths we'll never see again.
+//
+// Global acks (project_dir = "*") are never touched: canonProjectDir
+// rewrites "*" into an absolute path and the WHERE clause would no
+// longer match. That's the intended behavior — a global ack should
+// survive per-project excludes.
+func (s *Store) ClearProjectAcks(projectDir string) error {
+	projectDir = canonProjectDir(projectDir)
+	_, err := s.db.Exec(`DELETE FROM project_acks WHERE project_dir = ?`, projectDir)
+	return err
+}
+
+// ListProjectDirs returns every distinct project_dir currently carrying
+// alerts. Used by the exclude CLI to find what subtrees to wipe when a
+// new rule matches existing rows. Ordered for deterministic CLI output.
+func (s *Store) ListProjectDirs() ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT DISTINCT project_dir FROM project_alerts ORDER BY project_dir`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dirs []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return nil, err
+		}
+		dirs = append(dirs, d)
+	}
+	return dirs, rows.Err()
+}
+
 // GlobalAckScope is the sentinel project_dir value for acks that apply
 // everywhere. Callers wanting a global ack pass this explicitly — we reject
 // empty strings to avoid a cwd-inherited "" accidentally becoming global.

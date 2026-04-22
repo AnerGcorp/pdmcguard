@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
+	"github.com/AnerGcorp/pdmcguard/internal/excludes"
 )
 
 func TestScan_FindsProjectDirs(t *testing.T) {
@@ -28,7 +29,7 @@ func TestScan_FindsProjectDirs(t *testing.T) {
 	os.MkdirAll(nested, 0o755)
 	os.WriteFile(filepath.Join(nested, "package.json"), []byte("{}"), 0o644)
 
-	dirs, err := Scan(nil, []string{root})
+	dirs, err := Scan(nil, nil, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +64,7 @@ func TestScan_ExcludesVenv(t *testing.T) {
 	os.MkdirAll(proj, 0o755)
 	os.WriteFile(filepath.Join(proj, "requirements.txt"), []byte("flask"), 0o644)
 
-	dirs, err := Scan(nil, []string{root})
+	dirs, err := Scan(nil, nil, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +93,7 @@ func TestScan_AutoExcludesToStore(t *testing.T) {
 	}
 	defer store.Close()
 
-	_, err = Scan(store, []string{root})
+	_, err = Scan(store, nil, []string{root})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,5 +105,44 @@ func TestScan_AutoExcludesToStore(t *testing.T) {
 	}
 	if !store.IsExcluded(inode) {
 		t.Error("venv inode should have been auto-excluded during scan")
+	}
+}
+
+// TestScan_HonorsExcludesMatcher verifies the user-facing path-based
+// exclusion layer: a project living under a matcher-covered subtree is
+// skipped by the scan, even though it has a legitimate lockfile and
+// would otherwise be returned as a project dir.
+func TestScan_HonorsExcludesMatcher(t *testing.T) {
+	root := t.TempDir()
+
+	// Monorepo layout: `kept` is a real project, `legacy/pkg-a` has its
+	// own lockfile but lives under a subtree the user excluded.
+	kept := filepath.Join(root, "kept-project")
+	os.MkdirAll(kept, 0o755)
+	os.WriteFile(filepath.Join(kept, "package.json"), []byte("{}"), 0o644)
+
+	excludedSub := filepath.Join(root, "legacy", "pkg-a")
+	os.MkdirAll(excludedSub, 0o755)
+	os.WriteFile(filepath.Join(excludedSub, "package.json"), []byte("{}"), 0o644)
+
+	// Build a matcher with a prefix rule covering the whole `legacy` tree.
+	rulesPath := filepath.Join(t.TempDir(), "excludes")
+	legacy := filepath.Join(root, "legacy")
+	os.WriteFile(rulesPath, []byte(legacy+"\n"), 0o644)
+	m, err := excludes.Load(rulesPath)
+	if err != nil {
+		t.Fatalf("Load matcher: %v", err)
+	}
+
+	dirs, err := Scan(nil, m, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dirs) != 1 {
+		t.Fatalf("expected 1 project (excluded subtree dropped), got %d: %v", len(dirs), dirs)
+	}
+	if dirs[0] != kept {
+		t.Errorf("expected %s, got %s", kept, dirs[0])
 	}
 }

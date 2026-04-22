@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
+	"github.com/AnerGcorp/pdmcguard/internal/excludes"
 	"github.com/fsnotify/fsnotify"
 )
 
@@ -28,29 +29,41 @@ type Watcher struct {
 	Events chan PDMCChangeEvent
 	Errors chan error
 
-	fsw   *fsnotify.Watcher
-	store *classifier.ExcludeStore
-	deb   *debouncer
-	done  chan struct{}
+	fsw      *fsnotify.Watcher
+	store    *classifier.ExcludeStore
+	matcher  *excludes.Matcher
+	deb      *debouncer
+	done     chan struct{}
 }
 
 // New creates a Watcher backed by fsnotify. The ExcludeStore is used to skip
-// excluded directories when Add is called.
-func New(store *classifier.ExcludeStore) (*Watcher, error) {
+// excluded directories when Add is called. The matcher (may be nil) enforces
+// user-facing path-based exclusions both at Add time and inside the event
+// loop — the latter is defensive so a rule added after a directory is
+// already being watched silences pending events without requiring a daemon
+// restart.
+func New(store *classifier.ExcludeStore, matcher *excludes.Matcher) (*Watcher, error) {
 	fsw, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
 	w := &Watcher{
-		Events: make(chan PDMCChangeEvent, 64),
-		Errors: make(chan error, 8),
-		fsw:    fsw,
-		store:  store,
-		done:   make(chan struct{}),
+		Events:  make(chan PDMCChangeEvent, 64),
+		Errors:  make(chan error, 8),
+		fsw:     fsw,
+		store:   store,
+		matcher: matcher,
+		done:    make(chan struct{}),
 	}
 
 	w.deb = newDebouncer(debounceQuiet, func(path string) {
+		// Re-check matcher at debounce-fire time. MaybeReload inside
+		// Matches means a `pdmcguard exclude` issued between the
+		// fsnotify event and the debounce fire still takes effect.
+		if w.matcher != nil && w.matcher.Matches(path) {
+			return
+		}
 		base := filepath.Base(path)
 		eco, ok := PDMCFiles[base]
 		if !ok {
@@ -69,8 +82,13 @@ func New(store *classifier.ExcludeStore) (*Watcher, error) {
 }
 
 // Add starts watching a directory for PDMC file changes.
-// Returns false (without error) if the directory's inode is excluded.
+// Returns false (without error) if the directory is excluded — either by
+// a user path rule (consulted first, cheap in-memory match) or an inode
+// entry in the store.
 func (w *Watcher) Add(dir string) (bool, error) {
+	if w.matcher != nil && w.matcher.Matches(dir) {
+		return false, nil
+	}
 	if w.store != nil {
 		inode, err := classifier.InodeOf(dir)
 		if err == nil && w.store.IsExcluded(inode) {
@@ -105,6 +123,14 @@ func (w *Watcher) loop() {
 			}
 			base := filepath.Base(ev.Name)
 			if !IsPDMC(base) {
+				continue
+			}
+			// Defensive: drop events under an excluded path even if we
+			// somehow started watching it. Covers the race where a user
+			// runs `pdmcguard exclude` after the watcher registered the
+			// directory — the file-level event is suppressed immediately
+			// without waiting for a daemon restart.
+			if w.matcher != nil && w.matcher.Matches(ev.Name) {
 				continue
 			}
 			w.deb.touch(ev.Name)

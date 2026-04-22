@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/AnerGcorp/pdmcguard/internal/excludes"
 )
 
 func TestWatcher_PDMCEvent(t *testing.T) {
-	w, err := New(nil) // no exclude store
+	w, err := New(nil, nil) // no exclude store
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +47,7 @@ func TestWatcher_PDMCEvent(t *testing.T) {
 }
 
 func TestWatcher_IgnoresNonPDMC(t *testing.T) {
-	w, err := New(nil)
+	w, err := New(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +72,7 @@ func TestWatcher_IgnoresNonPDMC(t *testing.T) {
 }
 
 func TestWatcher_Debounce(t *testing.T) {
-	w, err := New(nil)
+	w, err := New(nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,5 +109,103 @@ loop:
 
 	if count != 1 {
 		t.Errorf("expected 1 debounced event, got %d", count)
+	}
+}
+
+// TestWatcher_AddHonorsMatcher verifies that a directory covered by a
+// user exclusion rule is refused at Add time: the call succeeds but
+// reports added=false, and fsnotify never registers the directory, so
+// subsequent file writes can't produce events.
+func TestWatcher_AddHonorsMatcher(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build a matcher with an absolute-prefix rule covering `dir`.
+	rules := filepath.Join(t.TempDir(), "excludes")
+	if err := os.WriteFile(rules, []byte(dir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := excludes.Load(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New(nil, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	added, err := w.Add(dir)
+	if err != nil {
+		t.Fatalf("Add returned error: %v", err)
+	}
+	if added {
+		t.Fatal("Add should return false for matcher-excluded dir")
+	}
+
+	// A write into the unwatched dir must not produce an event.
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case ev := <-w.Events:
+		t.Errorf("unexpected event from excluded dir: %+v", ev)
+	case <-time.After(800 * time.Millisecond):
+		// expected: silence
+	}
+}
+
+// TestWatcher_LoopFiltersMatcher exercises the defensive event-loop
+// filter: even if a directory was Add'd before a rule existed, a
+// subsequent rule write suppresses the event at the loop boundary.
+// Simulated here by Add'ing first with a tiny matcher that doesn't
+// match, then externally rewriting the rules file.
+func TestWatcher_LoopFiltersMatcher(t *testing.T) {
+	dir := t.TempDir()
+
+	rules := filepath.Join(t.TempDir(), "excludes")
+	// Start with an unrelated rule so the file exists and matcher is
+	// non-nil but the dir is currently allowed.
+	if err := os.WriteFile(rules, []byte("/nonexistent-elsewhere\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := excludes.Load(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := New(nil, m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	added, err := w.Add(dir)
+	if err != nil || !added {
+		t.Fatalf("Add(dir) initial: added=%v err=%v", added, err)
+	}
+
+	// Now a competing process (simulated) appends a rule covering dir.
+	// Bump mtime explicitly so MaybeReload picks it up even on fast
+	// filesystems where back-to-back writes share an mtime.
+	if err := os.WriteFile(rules, []byte(dir+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(time.Second)
+	if err := os.Chtimes(rules, future, future); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write a PDMC file. The fsnotify event fires on a registered dir
+	// (Add succeeded), but the loop's Matches() check drops it.
+	if err := os.WriteFile(filepath.Join(dir, "package.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case ev := <-w.Events:
+		t.Errorf("event should have been filtered by loop matcher, got %+v", ev)
+	case <-time.After(1500 * time.Millisecond):
+		// expected: silence (debounce(500ms) + margin)
 	}
 }

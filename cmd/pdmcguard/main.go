@@ -16,6 +16,7 @@ import (
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
 	"github.com/AnerGcorp/pdmcguard/internal/config"
 	"github.com/AnerGcorp/pdmcguard/internal/daemon"
+	"github.com/AnerGcorp/pdmcguard/internal/excludes"
 	"github.com/AnerGcorp/pdmcguard/internal/git"
 	"github.com/AnerGcorp/pdmcguard/internal/notify"
 	"github.com/AnerGcorp/pdmcguard/internal/sync"
@@ -86,6 +87,14 @@ func main() {
 			cmdUnack(filteredArgs[1:])
 			return
 
+		case "exclude":
+			cmdExclude(filteredArgs[1:])
+			return
+
+		case "unexclude":
+			cmdUnexclude(filteredArgs[1:])
+			return
+
 		case "help", "--help", "-h":
 			printUsage()
 			return
@@ -113,12 +122,24 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 	}
 	defer store.Close()
 
+	// Load user-facing path exclusions (~/.pdmcguard/excludes plus the
+	// hardcoded Defaults list). Missing file is fine — the file is
+	// created lazily by `pdmcguard exclude`. Matcher is passed to both
+	// bootstrap.Scan and watcher.New so rules take effect at both the
+	// initial walk and the live event loop; mtime-based hot reload
+	// picks up `pdmcguard exclude` without restart.
+	matcher, err := excludes.Load(config.FilePath("excludes"))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: load excludes: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Bootstrap: scan for project directories
 	roots := bootstrap.DefaultRoots()
 	roots = append(roots, extraRoots...)
 	fmt.Printf("Scanning roots: %v\n", roots)
 
-	dirs, err := bootstrap.Scan(store, roots)
+	dirs, err := bootstrap.Scan(store, matcher, roots)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: bootstrap scan: %v\n", err)
 		os.Exit(1)
@@ -129,7 +150,7 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 	}
 
 	// Start watcher
-	w, err := watcher.New(store)
+	w, err := watcher.New(store, matcher)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: create watcher: %v\n", err)
 		os.Exit(1)
@@ -288,6 +309,8 @@ Usage:
   pdmcguard hook-init       Output shell hook snippet (eval "$(pdmcguard hook-init)")
   pdmcguard ack <id>        Permanently dismiss an advisory (--all-projects for global, --list to show)
   pdmcguard unack <id>      Reverse a prior ack (--all-projects for global)
+  pdmcguard exclude <path>  Skip a path or basename from scans (--list to show rules)
+  pdmcguard unexclude <path>  Remove a previously-added exclusion rule
   pdmcguard version         Print version information
 
 Flags:

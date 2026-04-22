@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
+	"github.com/AnerGcorp/pdmcguard/internal/excludes"
 	"github.com/AnerGcorp/pdmcguard/internal/watcher"
 )
 
@@ -48,8 +49,18 @@ func DefaultRoots() []string {
 }
 
 // Scan walks the given roots and returns directories that contain at least
-// one PDMC file. Excluded directories (by inode in store) are skipped.
-func Scan(store *classifier.ExcludeStore, roots []string) ([]string, error) {
+// one PDMC file. Excluded directories are skipped. Three exclusion layers
+// compose here, in order:
+//
+//  1. Hidden directories (dot-prefix) and the hardcoded $HOME skipDirs list.
+//  2. User-facing path-based rules from `matcher` (may be nil during tests).
+//     This is the layer the `pdmcguard exclude` CLI feeds; it covers
+//     monorepo sub-packages and noisy non-classifiable trees that the
+//     classifier can't fingerprint.
+//  3. Classifier fingerprints (node_modules, venvs, .git, …) plus the
+//     inode-keyed store for ad-hoc entries. Checked last so a user rule
+//     can pre-empt an unnecessary classifier roundtrip on a huge tree.
+func Scan(store *classifier.ExcludeStore, matcher *excludes.Matcher, roots []string) ([]string, error) {
 	seen := make(map[string]bool)
 
 	// Determine $HOME for skip-list matching
@@ -71,6 +82,14 @@ func Scan(store *classifier.ExcludeStore, roots []string) ([]string, error) {
 
 				// Skip known heavy/irrelevant directories at $HOME level
 				if home != "" && filepath.Dir(path) == home && skipDirs[name] {
+					return fs.SkipDir
+				}
+
+				// User-facing path-based exclusions. Runs before Classify
+				// so a user rule on, say, ~/Projects/huge-monorepo/legacy
+				// shortcuts out without us stat'ing every fingerprint file
+				// in the subtree.
+				if matcher != nil && matcher.Matches(path) {
 					return fs.SkipDir
 				}
 
