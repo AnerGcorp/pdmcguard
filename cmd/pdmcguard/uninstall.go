@@ -23,6 +23,11 @@ func cmdUninstall(args []string) {
 	// 1. Stop and remove system service
 	svc := daemon.NewServiceManager()
 	if svc.IsInstalled() {
+		// TODO: svc.Stop() returns before launchd has finished unloading
+		// on macOS, so the daemon may briefly still hold the DB handle
+		// when we follow up with Uninstall/purge. --purge papers over it
+		// (daemon dies on next write into a deleted directory); a proper
+		// wait-for-exit is deferred to a later stage.
 		_ = svc.Stop()
 		if err := svc.Uninstall(); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: service removal failed: %v\n", err)

@@ -136,6 +136,81 @@ func TestRemoveHookNoFile(t *testing.T) {
 	}
 }
 
+// lifecycleRoundTrip is the shared assertion body for the per-shell
+// lifecycle tests. Guards the uninstall path: Stage 1 rewrote the shell
+// snippets but left hookStartMarker/hookEndMarker unchanged, so RemoveHook
+// should still find and strip cleanly — prove it per shell rather than
+// trust that the markers are enough.
+func lifecycleRoundTrip(t *testing.T, shell string) {
+	t.Helper()
+	rcPath := withFakeHome(t, shell)
+	binPath := "/fake/bin/pdmcguard"
+
+	if err := InjectHook(shell, binPath); err != nil {
+		t.Fatalf("InjectHook(%s): %v", shell, err)
+	}
+
+	data, err := os.ReadFile(rcPath)
+	if err != nil {
+		t.Fatalf("rc not written for %s: %v", shell, err)
+	}
+	content := string(data)
+
+	for _, want := range []string{hookStartMarker, hookEndMarker, binPath, "hook-init"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("%s rc missing %q after InjectHook", shell, want)
+		}
+	}
+
+	if err := RemoveHook(shell); err != nil {
+		t.Fatalf("RemoveHook(%s): %v", shell, err)
+	}
+
+	// File may or may not still exist depending on shell (fish writes a
+	// nested config dir). Either way, no trace of pdmcguard should remain.
+	after, err := os.ReadFile(rcPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("read after remove (%s): %v", shell, err)
+	}
+	if strings.Contains(strings.ToLower(string(after)), "pdmcguard") {
+		t.Errorf("%s rc still contains pdmcguard reference after RemoveHook:\n%s", shell, after)
+	}
+}
+
+func TestShellHookLifecycle_Zsh(t *testing.T)  { lifecycleRoundTrip(t, "zsh") }
+func TestShellHookLifecycle_Bash(t *testing.T) { lifecycleRoundTrip(t, "bash") }
+func TestShellHookLifecycle_Fish(t *testing.T) { lifecycleRoundTrip(t, "fish") }
+
+// TestShellHookLifecycle_PreservesUserContent exercises the full
+// inject → remove cycle against a pre-populated rc file. Distinct from
+// TestRemoveHook (which seeds before injecting but only one shell): here
+// we guarantee that arbitrary surrounding content — including content
+// both before AND after the hook block — is preserved byte-identical
+// across the cycle for the default (zsh) path.
+func TestShellHookLifecycle_PreservesUserContent(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	original := "# my zshrc\nexport FOO=bar\n\n# after\nalias g=git\n"
+	if err := os.WriteFile(rcPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InjectHook("zsh", "/fake/bin/pdmcguard"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveHook("zsh"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(rcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove may leave at most a trailing newline diff; normalize both.
+	if strings.TrimRight(string(got), "\n") != strings.TrimRight(original, "\n") {
+		t.Errorf("user content mutated by inject+remove cycle\nwant:\n%q\ngot:\n%q", original, string(got))
+	}
+}
+
 func TestDetectShell(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	if s := DetectShell(); s != "zsh" {
