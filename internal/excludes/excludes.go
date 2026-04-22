@@ -336,6 +336,66 @@ func (m *Matcher) UserRules() []string {
 	return out
 }
 
+// InspectResult summarizes the state of a rules file for `pdmcguard
+// doctor`. Unlike Load, which silently drops unparseable lines so the
+// daemon keeps running on a partially-broken file, Inspect surfaces the
+// skipped lines by number so the user can see exactly which rules
+// didn't land.
+type InspectResult struct {
+	// TotalLines is the number of newline-separated records in the file
+	// (blank trailing line excluded).
+	TotalLines int
+	// ParsedRules is how many lines produced a usable rule.
+	ParsedRules int
+	// BlankOrComment counts lines that were intentionally skipped
+	// (whitespace-only or starting with `#`). Those are not errors.
+	BlankOrComment int
+	// SkippedLines holds 1-based line numbers of lines that were neither
+	// blank/comment nor parseable — e.g. `fixtures/legacy`, which
+	// parseRule rejects because it's ambiguous. These are the ones the
+	// user almost certainly meant as rules but that won't ever match.
+	SkippedLines []int
+}
+
+// Inspect audits a rules file without mutating Matcher state. Returns a
+// zero-value result and nil error if the file doesn't exist (a fresh
+// install is healthy; there's just nothing to report). Returns an error
+// only if the file is present but unreadable — that's the one case
+// `doctor` treats as FAIL.
+func Inspect(path string) (InspectResult, error) {
+	var res InspectResult
+
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return res, nil
+		}
+		return res, fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	lineNo := 0
+	for sc.Scan() {
+		lineNo++
+		res.TotalLines++
+		trimmed := strings.TrimSpace(sc.Text())
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			res.BlankOrComment++
+			continue
+		}
+		if _, ok := parseRule(sc.Text()); ok {
+			res.ParsedRules++
+			continue
+		}
+		res.SkippedLines = append(res.SkippedLines, lineNo)
+	}
+	if err := sc.Err(); err != nil {
+		return res, fmt.Errorf("read %s: %w", path, err)
+	}
+	return res, nil
+}
+
 // readLines returns the file's lines verbatim, or nil if the file
 // doesn't exist. Used by Add/Remove to preserve comments and blank
 // lines through edits.

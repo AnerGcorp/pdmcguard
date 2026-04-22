@@ -233,6 +233,59 @@ fixtures
 	}
 }
 
+// TestInspect_FlagsInvalidLines is the headline guard for the helper
+// backing `pdmcguard doctor`: a file with a mix of comments, blanks,
+// real rules, and one silently-rejected line should report each
+// category distinctly and surface the skipped line's 1-based number.
+func TestInspect_FlagsInvalidLines(t *testing.T) {
+	_, path := newMatcher(t)
+	content := `# managed by pdmcguard
+
+/home/user/monorepo/legacy
+fixtures
+fixtures/legacy
+# trailing comment
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Inspect(path)
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+
+	// 6 content lines in the file (the trailing newline doesn't add one).
+	if res.TotalLines != 6 {
+		t.Errorf("TotalLines = %d, want 6", res.TotalLines)
+	}
+	if res.ParsedRules != 2 {
+		t.Errorf("ParsedRules = %d, want 2", res.ParsedRules)
+	}
+	// 1 leading `# managed`, 1 blank line 2, 1 trailing `# trailing comment`.
+	if res.BlankOrComment != 3 {
+		t.Errorf("BlankOrComment = %d, want 3", res.BlankOrComment)
+	}
+	// `fixtures/legacy` is on line 5.
+	if len(res.SkippedLines) != 1 || res.SkippedLines[0] != 5 {
+		t.Errorf("SkippedLines = %v, want [5]", res.SkippedLines)
+	}
+}
+
+// TestInspect_MissingFileIsClean ensures Inspect returns a zero result
+// (not an error) when the rules file doesn't exist — a fresh install
+// should report as healthy, not broken.
+func TestInspect_MissingFileIsClean(t *testing.T) {
+	_, path := newMatcher(t)
+	res, err := Inspect(path)
+	if err != nil {
+		t.Fatalf("Inspect on missing file: %v", err)
+	}
+	if res.TotalLines != 0 || res.ParsedRules != 0 || len(res.SkippedLines) != 0 {
+		t.Errorf("missing file should produce zero result, got %+v", res)
+	}
+}
+
 // TestTildeExpansion: "~/foo" in the file is expanded against
 // $HOME at parse time so match comparisons use absolute paths.
 func TestTildeExpansion(t *testing.T) {

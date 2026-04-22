@@ -143,6 +143,20 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// IntegrityCheck runs SQLite's `PRAGMA integrity_check` and returns the
+// first row. The expected healthy result is "ok"; anything else is a
+// corruption report that the caller (pdmcguard doctor) surfaces to the
+// user. Kept as a dedicated method rather than exposing the raw *sql.DB
+// so the cache package stays the single source of truth for its own
+// storage surface.
+func (s *Store) IntegrityCheck() (string, error) {
+	var result string
+	if err := s.db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+		return "", err
+	}
+	return result, nil
+}
+
 // canonProjectDir normalizes a project path for stable keying: resolve
 // symlinks (best-effort) then lexically clean. Falls back to Clean on
 // resolution failure so paths for removed projects still match what was

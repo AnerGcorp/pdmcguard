@@ -345,6 +345,144 @@ func TestInjectHook_PreservesSurroundingOnReinject(t *testing.T) {
 	}
 }
 
+// TestInspectHook_Intact is the all-green case: a freshly-injected hook
+// block should report as Present, PathLineOK, and EvalLineOK.
+func TestInspectHook_Intact(t *testing.T) {
+	withFakeHome(t, "zsh")
+	if err := InjectHook("zsh", "/fake/bin/pdmcguard"); err != nil {
+		t.Fatal(err)
+	}
+
+	ins, err := InspectHook("zsh")
+	if err != nil {
+		t.Fatalf("InspectHook: %v", err)
+	}
+	if !ins.Exists {
+		t.Error("expected Exists=true after Inject")
+	}
+	if !ins.Present {
+		t.Error("expected Present=true for freshly-injected block")
+	}
+	if !ins.PathLineOK {
+		t.Error("expected PathLineOK=true (Inject writes PATH line)")
+	}
+	if !ins.EvalLineOK {
+		t.Error("expected EvalLineOK=true (Inject writes eval line)")
+	}
+}
+
+// TestInspectHook_MissingRC covers the first-time user: no rc file at
+// all. InspectHook should surface that cleanly (Exists=false, no error)
+// so doctor can say "shell hook not installed" instead of "FAIL: read
+// error".
+func TestInspectHook_MissingRC(t *testing.T) {
+	withFakeHome(t, "zsh")
+
+	ins, err := InspectHook("zsh")
+	if err != nil {
+		t.Fatalf("InspectHook on missing rc: %v", err)
+	}
+	if ins.Exists {
+		t.Error("expected Exists=false when rc is absent")
+	}
+	if ins.Present {
+		t.Error("expected Present=false when rc is absent")
+	}
+}
+
+// TestInspectHook_StrippedBlock simulates a user who deleted the block
+// by hand (a `sed` in an rc cleanup script, a migration gone wrong).
+// InspectHook must report Exists=true, Present=false — the rc is
+// readable, but our markers are gone.
+func TestInspectHook_StrippedBlock(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	if err := os.WriteFile(rcPath, []byte("# my zshrc\nexport FOO=bar\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ins, err := InspectHook("zsh")
+	if err != nil {
+		t.Fatalf("InspectHook: %v", err)
+	}
+	if !ins.Exists {
+		t.Error("rc exists on disk; Exists should be true")
+	}
+	if ins.Present {
+		t.Error("no markers → Present should be false")
+	}
+	if ins.PathLineOK || ins.EvalLineOK {
+		t.Error("no block → PathLineOK/EvalLineOK must both be false")
+	}
+}
+
+// TestInspectHook_PartialBlock covers the "user hand-edited and left a
+// half-finished mess" case: start marker present, end marker missing.
+// The block is effectively broken — Present must be false so doctor
+// reports it as FAIL rather than ignoring the corruption.
+func TestInspectHook_PartialBlock(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	content := "# my zshrc\n" + hookStartMarker + "\nexport PATH=\"/foo:$PATH\"\n"
+	if err := os.WriteFile(rcPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ins, err := InspectHook("zsh")
+	if err != nil {
+		t.Fatalf("InspectHook: %v", err)
+	}
+	if !ins.Exists {
+		t.Error("rc exists; Exists should be true")
+	}
+	if ins.Present {
+		t.Error("end marker missing → Present must be false")
+	}
+}
+
+// TestInspectHook_MissingEvalLine catches the nastiest failure mode:
+// user deleted only the eval line. Markers intact, PATH line present,
+// but the pre-prompt check never fires. Doctor should flag this as a
+// real problem, not OK.
+func TestInspectHook_MissingEvalLine(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	// Valid markers, PATH line present, eval line intentionally absent.
+	content := "\n" + hookStartMarker + "\nexport PATH=\"/foo:$PATH\"\n" + hookEndMarker + "\n"
+	if err := os.WriteFile(rcPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ins, err := InspectHook("zsh")
+	if err != nil {
+		t.Fatalf("InspectHook: %v", err)
+	}
+	if !ins.Present {
+		t.Error("markers present → Present should be true")
+	}
+	if !ins.PathLineOK {
+		t.Error("PATH line is present → PathLineOK should be true")
+	}
+	if ins.EvalLineOK {
+		t.Error("eval line absent → EvalLineOK must be false")
+	}
+}
+
+// TestInspectHook_Fish ensures the fish-specific syntax (`set -gx PATH`
+// and `source` instead of `eval`) doesn't fool the inspector into
+// reporting a valid fish hook as broken.
+func TestInspectHook_Fish(t *testing.T) {
+	withFakeHome(t, "fish")
+	if err := InjectHook("fish", "/fake/bin/pdmcguard"); err != nil {
+		t.Fatal(err)
+	}
+
+	ins, err := InspectHook("fish")
+	if err != nil {
+		t.Fatalf("InspectHook(fish): %v", err)
+	}
+	if !ins.Present || !ins.PathLineOK || !ins.EvalLineOK {
+		t.Errorf("fish hook should be fully detected: %+v", ins)
+	}
+}
+
 func TestDetectShell(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	if s := DetectShell(); s != "zsh" {

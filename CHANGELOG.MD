@@ -10,6 +10,24 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `pdmcguard doctor` one-shot health check. Runs eleven read-only checks
+  across install state (config dir, installed binary, PATH resolution,
+  system service, shell hook block integrity), auth (credentials file),
+  cache (reachability + SQLite `PRAGMA integrity_check`), sync (queue
+  depth), consistency (`alerts.flag` vs `HasAnyCritical`), and the
+  user excludes file. Emits `[OK]` / `[WARN]` / `[FAIL]` rows with a
+  summary line; exit code 1 iff any check fails (WARN is advisory and
+  does not fail the command, so `pdmcguard doctor && ...` survives
+  offline mode). `--verbose` expands skipped-excludes line numbers,
+  sentinel drift context, and other diagnostics.
+- `daemon.InspectHook(shell)` and `excludes.Inspect(path)` — structured
+  readback helpers backing doctor. `InspectHook` shares the
+  `hookStartMarker` / `hookEndMarker` constants with `InjectHook` so
+  detection stays in sync with injection; `excludes.Inspect` reports
+  parsed-vs-skipped line counts where `Load` would have silently dropped
+  bad lines.
+- `cache.Store.IntegrityCheck()` wraps SQLite's `PRAGMA integrity_check`
+  so doctor doesn't reach around cache's private `*sql.DB`.
 - Path-based user exclusion mechanism. `pdmcguard exclude <path>` adds a
   prefix rule; `pdmcguard exclude <basename>` adds a component-match
   rule (e.g. `node_modules` silences every `node_modules` tree anywhere).

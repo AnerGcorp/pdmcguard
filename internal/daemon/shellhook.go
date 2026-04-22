@@ -86,6 +86,86 @@ func RemoveHook(shell string) error {
 	return os.WriteFile(rcPath, []byte(stripHookBlock(string(data))), 0o644)
 }
 
+// HookInspection reports what `pdmcguard doctor` sees when it looks at
+// the shell rc file. Structured (not just a bool) because "broken" has
+// several flavors the user should be able to distinguish — stripped
+// block (reinstall fixes), partial block (likely hand-edit), or totally
+// missing (first-time user). All fields are set unconditionally; the
+// caller decides how to render absence.
+type HookInspection struct {
+	// RCPath is the file Inspect looked at (e.g. ~/.zshrc). Set even
+	// when the file doesn't exist.
+	RCPath string
+	// Shell is the detected / provided shell name (zsh, bash, fish).
+	Shell string
+	// Exists reports whether the rc file is present on disk. A missing
+	// rc file is a hook-not-installed condition, not a read error.
+	Exists bool
+	// Present is true iff both markers are present and in the expected
+	// order. A half-block (start marker only) reads as Present=false.
+	Present bool
+	// PathLineOK is true when the `export PATH=...` (or fish `set -gx
+	// PATH ...`) line is inside the block. Required — without it
+	// `pdmcguard <subcmd>` won't resolve on clean machines.
+	PathLineOK bool
+	// EvalLineOK is true when the `eval "$(pdmcguard hook-init)"` line
+	// is inside the block. Required — without it the pre-prompt warning
+	// never fires.
+	EvalLineOK bool
+}
+
+// InspectHook reads the user's shell rc and reports what's inside the
+// marker-delimited PDMCGuard block. Intended for `pdmcguard doctor`, so
+// it never mutates the file and distinguishes "no hook" (Exists but
+// Present=false) from "RC missing entirely" (Exists=false). Returns an
+// error only for non-ENOENT read failures.
+//
+// This is the single readback twin of InjectHook: both agree on the
+// same hookStartMarker / hookEndMarker, so if the marker format ever
+// changes, detection and injection stay in sync.
+func InspectHook(shell string) (HookInspection, error) {
+	res := HookInspection{
+		RCPath: ShellRCPath(shell),
+		Shell:  shell,
+	}
+
+	data, err := os.ReadFile(res.RCPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return res, nil
+		}
+		return res, fmt.Errorf("read %s: %w", res.RCPath, err)
+	}
+	res.Exists = true
+
+	content := string(data)
+	startIdx := strings.Index(content, hookStartMarker)
+	endIdx := strings.Index(content, hookEndMarker)
+	if startIdx < 0 || endIdx < 0 || endIdx < startIdx {
+		return res, nil
+	}
+	res.Present = true
+
+	// Inspect only the block body — user content outside the markers
+	// that happens to look like our lines isn't our business.
+	block := content[startIdx : endIdx+len(hookEndMarker)]
+
+	// PATH line: bash/zsh use `export PATH=`, fish uses `set -gx PATH`.
+	// Substring check over regex: cheap, good-enough, survives quoting
+	// variations that a regex would need special-casing for.
+	if strings.Contains(block, "export PATH=") || strings.Contains(block, "set -gx PATH") {
+		res.PathLineOK = true
+	}
+	// Eval line: bash/zsh use `eval "$(...hook-init)"`, fish pipes
+	// through `| source`. Either counts as wired up.
+	if (strings.Contains(block, "eval") && strings.Contains(block, "hook-init")) ||
+		(strings.Contains(block, "hook-init") && strings.Contains(block, "source")) {
+		res.EvalLineOK = true
+	}
+
+	return res, nil
+}
+
 // stripHookBlock returns content with any content between the start/end
 // markers (inclusive, plus the surrounding newlines) removed. If the
 // markers aren't present or are malformed (end before start) the input is

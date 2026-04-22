@@ -95,6 +95,10 @@ func main() {
 			cmdUnexclude(filteredArgs[1:])
 			return
 
+		case "doctor":
+			cmdDoctor(filteredArgs[1:])
+			return
+
 		case "help", "--help", "-h":
 			printUsage()
 			return
@@ -311,6 +315,7 @@ Usage:
   pdmcguard unack <id>      Reverse a prior ack (--all-projects for global)
   pdmcguard exclude <path>  Skip a path or basename from scans (--list to show rules)
   pdmcguard unexclude <path>  Remove a previously-added exclusion rule
+  pdmcguard doctor          Run a health check across install, cache, and config
   pdmcguard version         Print version information
 
 Flags:
