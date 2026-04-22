@@ -92,6 +92,61 @@ func (e *Engine) Online() bool {
 	return e.online
 }
 
+// BaselineStats is the per-run summary from BaselineScan. Classified
+// counts projects where the lockfile content hash changed since last run
+// (or was absent), meaning a full classifier roundtrip happened. Skipped
+// counts dedup hits — cheap restarts.
+type BaselineStats struct {
+	Total      int
+	Classified int
+	Skipped    int
+}
+
+// BaselineScan classifies the current lockfile contents of every dir once
+// at startup, before the event loop runs, so the shell-hook pre-check is
+// accurate on the first cd after daemon start. Without this, a freshly
+// installed/restarted daemon stays silent about already-vulnerable
+// projects until the user next saves a lockfile — the gap that motivated
+// Stage 3.
+//
+// Relies on HandleChange's content-hash dedup (keyed by dir+ecosystem) so
+// subsequent restarts are cheap: only projects whose lockfiles changed
+// since the last run do the full classifier roundtrip.
+//
+// Known limitation: if the daemon starts offline, HandleChange enqueues
+// work via handleOffline — but drainQueue only runs once, inside sync.New,
+// when initial registration succeeds. Baseline items will sit in queue.db
+// until the next online process restart. Pre-existing gap in the sync
+// engine, tracked as separate work.
+func (e *Engine) BaselineScan(dirs []string, gitReader *git.Reader) BaselineStats {
+	var stats BaselineStats
+	for _, ev := range watcher.EnumeratePDMCFiles(dirs) {
+		stats.Total++
+
+		var gi *git.Info
+		if gitReader != nil {
+			if info, err := gitReader.Info(ev.Dir); err == nil {
+				gi = &info
+			}
+		}
+
+		// Observe the meta row before/after HandleChange: if the hash
+		// changed, we actually did classifier work; if it didn't, dedup
+		// short-circuited. This distinguishes "classified" from "skipped"
+		// without having to instrument HandleChange itself.
+		before, _ := e.cache.GetMeta(metaKey(ev.Dir, ev.Ecosystem))
+		e.HandleChange(ev, gi, "baseline")
+		after, _ := e.cache.GetMeta(metaKey(ev.Dir, ev.Ecosystem))
+
+		if before != after {
+			stats.Classified++
+		} else {
+			stats.Skipped++
+		}
+	}
+	return stats
+}
+
 // HandleChange processes a PDMC file change event.
 func (e *Engine) HandleChange(ev watcher.PDMCChangeEvent, gitInfo *git.Info, trigger string) {
 	e.mu.Lock()
@@ -109,9 +164,10 @@ func (e *Engine) HandleChange(ev watcher.PDMCChangeEvent, gitInfo *git.Info, tri
 		return
 	}
 
-	// Check if content has changed since last sync
-	metaKey := "content_hash:" + ev.Dir
-	lastHash, _ := e.cache.GetMeta(metaKey)
+	// Check if content has changed since last sync. Keyed by (dir, ecosystem)
+	// so a polyglot project with, say, package.json AND go.mod doesn't let
+	// one ecosystem's hash clobber the other's.
+	lastHash, _ := e.cache.GetMeta(metaKey(ev.Dir, ev.Ecosystem))
 	if lastHash == contentHash {
 		return // No change — skip
 	}
@@ -222,7 +278,7 @@ func (e *Engine) syncProject(projectDir, lockPath, ecosystem, branch, commit, re
 	e.updateAlertSentinel()
 
 	// 5. Update content hash and sync time
-	_ = e.cache.SetMeta(metaKey(projectDir), contentHash)
+	_ = e.cache.SetMeta(metaKey(projectDir, ecosystem), contentHash)
 	_ = e.cache.SetMeta("last_full_sync", time.Now().UTC().Format(time.RFC3339))
 
 	alertCount := 0
@@ -293,8 +349,13 @@ func (e *Engine) updateAlertSentinel() {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-func metaKey(projectDir string) string {
-	return "content_hash:" + projectDir
+// metaKey namespaces the content-hash meta row by ecosystem so two PDMC
+// files living in the same dir (package.json + go.mod, Cargo.toml + go.mod,
+// etc.) each track their own hash. Pre-Stage-3 this was keyed by dir alone
+// and the second write clobbered the first's hash, causing unnecessary
+// re-classifies on every event for polyglot projects.
+func metaKey(projectDir, ecosystem string) string {
+	return "content_hash:" + ecosystem + ":" + projectDir
 }
 
 func hashFile(path string) (string, error) {

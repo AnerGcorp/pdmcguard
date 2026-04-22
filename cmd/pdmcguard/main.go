@@ -31,13 +31,20 @@ var (
 
 func main() {
 	// Collect --root flags for custom scan roots (before command parsing)
+	// and the --no-baseline flag that skips the Stage 3 startup baseline
+	// pass. Flags are stripped from filteredArgs so the subcommand switch
+	// below still sees the command as arg[0].
 	var extraRoots []string
+	var noBaseline bool
 	var filteredArgs []string
 	for i := 1; i < len(os.Args); i++ {
-		if os.Args[i] == "--root" && i+1 < len(os.Args) {
+		switch {
+		case os.Args[i] == "--root" && i+1 < len(os.Args):
 			extraRoots = append(extraRoots, os.Args[i+1])
 			i++
-		} else {
+		case os.Args[i] == "--no-baseline":
+			noBaseline = true
+		default:
 			filteredArgs = append(filteredArgs, os.Args[i])
 		}
 	}
@@ -83,10 +90,10 @@ func main() {
 	}
 
 	// Default: run as daemon
-	runDaemon(extraRoots)
+	runDaemon(extraRoots, noBaseline)
 }
 
-func runDaemon(extraRoots []string) {
+func runDaemon(extraRoots []string, noBaseline bool) {
 	fmt.Printf("pdmcguard %s starting...\n", version)
 	fmt.Printf("Config dir: %s\n", config.Dir())
 
@@ -160,6 +167,25 @@ func runDaemon(extraRoots []string) {
 			sseListener := notify.NewSSEListener(creds.APIURL, creds.AccessToken)
 			go sseListener.Run(ctx)
 		}
+	}
+
+	// Baseline scan: classify every tracked project once before entering the
+	// event loop so the shell-hook pre-check is accurate on the very first
+	// cd after daemon start. HandleChange's content-hash dedup (keyed by
+	// dir+ecosystem) makes this cheap on subsequent restarts — only
+	// projects whose lockfiles actually changed since last run do the full
+	// classifier roundtrip.
+	//
+	// Opt-out via --no-baseline flag or PDMCGUARD_BASELINE=0/false env var
+	// (either disables). Ships on day one because slow startup is the exact
+	// symptom users should self-diagnose without waiting for a release.
+	envVal := os.Getenv("PDMCGUARD_BASELINE")
+	baselineOff := noBaseline || envVal == "0" || envVal == "false"
+	if !baselineOff {
+		fmt.Println("Running baseline scan...")
+		stats := syncEngine.BaselineScan(dirs, gitReader)
+		fmt.Printf("Baseline: %d projects (%d classified, %d unchanged)\n",
+			stats.Total, stats.Classified, stats.Skipped)
 	}
 
 	fmt.Println("Watching for PDMC file changes... (Ctrl+C to stop)")
