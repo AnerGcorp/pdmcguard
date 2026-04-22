@@ -11,6 +11,21 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.1] - 2026-04-22
+
+### Fixed
+- `pdmcguard install` now adds `~/.pdmcguard/bin` to `PATH` inside the
+  shell-hook block it owns, so `pdmcguard <subcommand>` resolves to the
+  freshly-installed binary instead of a stale global copy (or
+  "command not found" on clean machines). Existing installs pick up
+  the fix by re-running `pdmcguard install` — `InjectHook` now strips
+  any prior block and rewrites, making the installer a real upgrade
+  vector instead of short-circuiting on "already present".
+- Shell-hook PATH line uses shell-specific syntax: `export PATH=...`
+  for bash/zsh, `set -gx PATH ...` for fish.
+
+---
+
 ## [0.3.0] - 2026-04-22
 
 ### Added
