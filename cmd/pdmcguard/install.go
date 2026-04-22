@@ -72,9 +72,9 @@ func cmdInstall(args []string) {
 		}
 		if err := svc.Install(destBin); err != nil {
 			fmt.Fprintf(os.Stderr, "  warning: service registration failed: %v\n", err)
-			fmt.Fprintln(os.Stderr, "  You can run the daemon manually: pdmcguard")
+			fmt.Fprintln(os.Stderr, "  You can still run the daemon manually: pdmcguard start")
 		} else {
-			fmt.Println("  System service registered and started")
+			fmt.Println("  System service registered (not started)")
 		}
 	}
 
@@ -93,9 +93,11 @@ func cmdInstall(args []string) {
 	fmt.Println("PDMCGuard installed successfully!")
 	fmt.Println()
 	fmt.Println("Next steps:")
-	fmt.Println("  1. Open a new terminal (or run: source " + daemon.ShellRCPath(daemon.DetectShell()) + ")")
-	fmt.Println("  2. Run: pdmcguard login")
-	fmt.Println("  3. Navigate to a project — PDMCGuard will warn about critical advisories")
+	fmt.Println("  1. Start the daemon:  pdmcguard start")
+	fmt.Println("  2. Open a new terminal (or run: source " + daemon.ShellRCPath(daemon.DetectShell()) + ")")
+	fmt.Println("  3. Optional: pdmcguard login   (connect to dashboard; offline mode also works)")
+	fmt.Println()
+	fmt.Println("If a daemon was running before this reinstall, run `pdmcguard start` to resume.")
 }
 
 // verifyBinary sanity-checks the source file before a copy. Catches two

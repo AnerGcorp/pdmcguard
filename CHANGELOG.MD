@@ -10,6 +10,22 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `pdmcguard start` / `pdmcguard stop` — activation verbs that work with or
+  without a registered service. When the launchd/systemd unit is installed
+  they delegate to it; otherwise `start` background-spawns via `Setsid` with
+  a pidfile at `~/.pdmcguard/daemon.pid` and logs at `~/.pdmcguard/daemon.log`,
+  and `stop` reads the pidfile and escalates SIGTERM → (5s grace) → SIGKILL.
+  `start` refuses when a daemon is already running (detected via IPC-socket
+  probe, uniform across service and bare paths); `stop` is idempotent when
+  no daemon is running or the pidfile is stale.
+- `pdmcguard status` now shows `Daemon: running (PID N)` / `stopped` alongside
+  the existing `Service:` line, so "registered" and "running" are
+  distinguishable at a glance. Liveness uses the IPC socket (authoritative)
+  with the pidfile only consulted to attach a PID to the running message.
+- Pidfile lifecycle in `runDaemon`: every start path (service-managed,
+  background-spawn, foreground) now acquires `~/.pdmcguard/daemon.pid` with
+  stale-PID recovery before any store/watcher setup, so a duplicate start
+  exits cheaply instead of briefly double-binding.
 - `pdmcguard track [path]` explicit project registration via a new Unix-domain
   socket IPC surface. The daemon listens on `~/.pdmcguard/daemon.sock` (0600)
   and the CLI dials it with a newline-delimited JSON request: `{"op":"track",
@@ -87,6 +103,19 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   acks (`project_dir = '*'`) are preserved.
 
 ### Changed
+- `pdmcguard install` no longer starts the daemon. It copies the binary,
+  injects the shell hook, and registers the service unit (drops the
+  `--now` / `launchctl load` step). Run `pdmcguard start` afterward, or
+  `pdmcguard install && pdmcguard start` in one line. This matches
+  launchctl's `load`-vs-`start` and systemctl's `enable`-vs-`start`
+  separation, and aligns the curl-installer narrative — after the
+  install script drops the binary, `install` is configuration and
+  `start` is activation.
+- `ServiceManager.Start` absorbs the load/enable-now step so callers
+  don't have to reason about idempotency (`launchctl load -w` is
+  safe to call on a never-loaded or already-loaded plist).
+- `install.sh` next-steps panel reshaped: `pdmcguard install` → `start`
+  → optional `login`.
 - `bootstrap.Scan` and `watcher.New` both accept a `*excludes.Matcher`
   argument. Call sites in tests that pass `nil` continue to work —
   matcher is optional, defaults still apply for the CLI path.

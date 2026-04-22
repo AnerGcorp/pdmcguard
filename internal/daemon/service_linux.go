@@ -57,11 +57,14 @@ WantedBy=default.target
 		return fmt.Errorf("write unit file: %w", err)
 	}
 
-	// Reload and enable
+	// Reload and enable. `enable` (without `--now`) registers the unit
+	// for auto-start at login but does NOT start it in this session —
+	// Install is configuration, Start is activation. Users type
+	// `pdmcguard install && pdmcguard start`.
 	if err := exec.Command("systemctl", "--user", "daemon-reload").Run(); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
-	if err := exec.Command("systemctl", "--user", "enable", "--now", "pdmcguard.service").Run(); err != nil {
+	if err := exec.Command("systemctl", "--user", "enable", "pdmcguard.service").Run(); err != nil {
 		return fmt.Errorf("systemctl enable: %w", err)
 	}
 

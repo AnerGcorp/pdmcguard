@@ -65,11 +65,10 @@ func (s *LaunchdService) Install(binPath string) error {
 		return fmt.Errorf("write plist: %w", err)
 	}
 
-	// Load the service
-	if err := exec.Command("launchctl", "load", s.plistPath()).Run(); err != nil {
-		return fmt.Errorf("launchctl load: %w", err)
-	}
-
+	// Intentionally NOT running `launchctl load` here — Install is the
+	// configuration verb (drop the plist on disk, mirror systemctl's
+	// `enable` without `--now`). Start is what actually loads and runs
+	// the daemon. Users type `pdmcguard install && pdmcguard start`.
 	return nil
 }
 
@@ -93,7 +92,17 @@ func (s *LaunchdService) IsInstalled() bool {
 	return err == nil
 }
 
+// Start registers the plist with launchd (idempotent via `load -w`) and
+// nudges it to run. `load -w` clears the Disabled key and loads the job
+// in one step — safe to call whether the plist was never loaded or is
+// already loaded from a prior session. The explicit `start` is a
+// belt-and-braces nudge: plist has RunAtLoad=true, but if launchd
+// considers the job "already loaded and exited" it won't re-run on a
+// second load without an explicit start.
 func (s *LaunchdService) Start() error {
+	if err := exec.Command("launchctl", "load", "-w", s.plistPath()).Run(); err != nil {
+		return fmt.Errorf("launchctl load: %w", err)
+	}
 	return exec.Command("launchctl", "start", serviceLabel).Run()
 }
 

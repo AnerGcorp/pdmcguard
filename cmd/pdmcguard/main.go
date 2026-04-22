@@ -70,6 +70,14 @@ func main() {
 			cmdUninstall(filteredArgs[1:])
 			return
 
+		case "start":
+			cmdStart(filteredArgs[1:])
+			return
+
+		case "stop":
+			cmdStop(filteredArgs[1:])
+			return
+
 		case "login":
 			cmdLogin(filteredArgs[1:])
 			return
@@ -130,6 +138,19 @@ func main() {
 func runDaemon(extraRoots []string, noBaseline bool) {
 	fmt.Printf("pdmcguard %s starting...\n", version)
 	fmt.Printf("Config dir: %s\n", config.Dir())
+
+	// Pidfile is the authority for "is a daemon already running under this
+	// user." All start paths (service, background-spawn, foreground)
+	// converge here — acquiring before any expensive setup means a
+	// duplicate start exits cheaply instead of briefly double-running the
+	// store/watcher/sync engine. Stale files from a prior crash are
+	// detected and overwritten inside acquirePidfile.
+	pidfile := config.FilePath("daemon.pid")
+	if err := acquirePidfile(pidfile); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(pidfile)
 
 	// Open exclude store
 	store, err := classifier.OpenExcludeStore(config.FilePath("excludes.db"))
@@ -470,12 +491,29 @@ func cmdStatus() {
 		}
 	}
 
-	// IPC socket — stat-only check. Status stays fast and never hangs
-	// on a pathological socket; `pdmcguard doctor` is where liveness is
-	// actually verified with a dial.
-	if _, err := os.Stat(daemon.SocketPath()); err == nil {
+	// Daemon liveness. The IPC socket is the uniform authority: a
+	// successful Dial means *something* is accepting, regardless of
+	// whether it was started via launchctl/systemctl, `pdmcguard start`,
+	// or a bare foreground `pdmcguard`. Dial has a short timeout inside
+	// daemon.Dial, so this stays fast on a pathological socket.
+	daemonRunning := false
+	if conn, err := daemon.Dial(daemon.SocketPath()); err == nil {
+		conn.Close()
+		daemonRunning = true
+	}
+	if daemonRunning {
+		if data, err := os.ReadFile(config.FilePath("daemon.pid")); err == nil {
+			if pid, perr := parsePid(string(data)); perr == nil {
+				fmt.Printf("Daemon:      running (PID %d)\n", pid)
+			} else {
+				fmt.Println("Daemon:      running")
+			}
+		} else {
+			fmt.Println("Daemon:      running")
+		}
 		fmt.Printf("IPC:         listening at %s\n", daemon.SocketPath())
 	} else {
+		fmt.Println("Daemon:      stopped")
 		fmt.Println("IPC:         daemon not running")
 	}
 
@@ -497,8 +535,10 @@ func printUsage() {
 
 Usage:
   pdmcguard [--root DIR]    Run as background daemon
-  pdmcguard install         Install daemon, shell hooks, and system service
+  pdmcguard install         Install binary, shell hooks, and system service (does not start)
   pdmcguard uninstall       Remove system service and shell hooks (--purge to remove data)
+  pdmcguard start           Start the daemon (via service, or detached background spawn)
+  pdmcguard stop            Stop the daemon (via service, or by pidfile)
   pdmcguard login           Authenticate with PDMCGuard cloud (--api-url for self-hosted)
   pdmcguard status          Show daemon status, sync mode, and queue depth
   pdmcguard pre-check       Check current project for critical advisories (used by shell hook)
