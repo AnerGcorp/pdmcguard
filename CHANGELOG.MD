@@ -9,6 +9,30 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Path-based user exclusion mechanism. `pdmcguard exclude <path>` adds a
+  prefix rule; `pdmcguard exclude <basename>` adds a component-match
+  rule (e.g. `node_modules` silences every `node_modules` tree anywhere).
+  Rules persist to `~/.pdmcguard/excludes` and are enforced at both
+  bootstrap scan time and the live watcher — so a rule added to a running
+  daemon takes effect within one stat (via mtime-based hot reload) instead
+  of waiting for a restart.
+- `pdmcguard exclude --list` shows active user rules and the hardcoded
+  `[default]` list (`node_modules`, `.yarn`, `target`, `dist`, `build`,
+  `.next`, `.venv`, `venv`, `.tox`, `.cache`, `.gradle`, `vendor`, …).
+- `pdmcguard unexclude <path>` reverses a prior exclude. The daemon
+  re-populates alerts on its next scan.
+- `pdmcguard exclude` performs a one-shot DB cleanup: `project_alerts`
+  and per-project `project_acks` rows under the newly-excluded subtree
+  are wiped immediately, then the alert sentinel is reconciled so a
+  fully-silenced machine goes quiet without a second round-trip. Global
+  acks (`project_dir = '*'`) are preserved.
+
+### Changed
+- `bootstrap.Scan` and `watcher.New` both accept a `*excludes.Matcher`
+  argument. Call sites in tests that pass `nil` continue to work —
+  matcher is optional, defaults still apply for the CLI path.
+
 ---
 
 ## [0.3.1] - 2026-04-22
