@@ -6,12 +6,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/AnerGcorp/pdmcguard/internal/cache"
 	"github.com/AnerGcorp/pdmcguard/internal/daemon"
@@ -70,6 +73,10 @@ func baseDeps(t *testing.T, dir string) doctorDeps {
 		openQueue:       func() (*queueHandle, error) { return nil, nil },
 		sentinelPath:    func() string { return filepath.Join(dir, "alerts.flag") },
 		inspectExcludes: func(string) (excludes.InspectResult, error) { return excludes.InspectResult{}, nil },
+		socketPath:      func() string { return filepath.Join(dir, "daemon.sock") },
+		// Default dial: pretend the daemon isn't running. Tests that
+		// assert OK override this to point at a real live listener.
+		dialIPC: func(string) (net.Conn, error) { return nil, daemon.ErrDaemonNotRunning },
 	}
 }
 
@@ -364,6 +371,59 @@ func TestCheckExcludes(t *testing.T) {
 	}
 	if r := checkExcludes(deps); r.status != statusFail {
 		t.Errorf("unreadable: status = %v, want FAIL", r.status)
+	}
+}
+
+// TestCheckIPC covers the three dispositions: socket missing (WARN —
+// daemon not running yet, install pipelines must survive), socket
+// present + dial succeeds (OK), socket present but dial refuses (FAIL —
+// stale inode the daemon hasn't reclaimed).
+func TestCheckIPC(t *testing.T) {
+	dir := t.TempDir()
+
+	// WARN: socket missing.
+	deps := baseDeps(t, dir)
+	r := checkIPC(deps)
+	if r.status != statusWarn {
+		t.Errorf("missing socket: status = %v, want WARN (%q)", r.status, r.message)
+	}
+
+	// OK: bring up a real listener on a temp socket and dial it.
+	sock := filepath.Join(dir, "daemon.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go daemon.Listen(ctx, sock, func(context.Context, daemon.Request) daemon.Response {
+		return daemon.Response{OK: true}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if fi, err := os.Stat(sock); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	deps.socketPath = func() string { return sock }
+	deps.dialIPC = daemon.Dial
+	r = checkIPC(deps)
+	if r.status != statusOK {
+		t.Errorf("live listener: status = %v, want OK (%q)", r.status, r.message)
+	}
+	cancel()
+
+	// FAIL: stale socket file — stat succeeds but Dial surfaces
+	// ErrDaemonNotRunning (our Dial maps ECONNREFUSED to it).
+	stale := filepath.Join(dir, "stale.sock")
+	if err := os.WriteFile(stale, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deps.socketPath = func() string { return stale }
+	deps.dialIPC = func(string) (net.Conn, error) { return nil, daemon.ErrDaemonNotRunning }
+	r = checkIPC(deps)
+	if r.status != statusFail {
+		t.Errorf("stale socket: status = %v, want FAIL (%q)", r.status, r.message)
+	}
+	if !strings.Contains(r.message, "stale") {
+		t.Errorf("FAIL message should mention 'stale', got %q", r.message)
 	}
 }
 

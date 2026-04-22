@@ -10,6 +10,29 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `pdmcguard track [path]` explicit project registration via a new Unix-domain
+  socket IPC surface. The daemon listens on `~/.pdmcguard/daemon.sock` (0600)
+  and the CLI dials it with a newline-delimited JSON request: `{"op":"track",
+  "path":"/abs/..."}`. Handler runs `bootstrap.ScanOne` (same exclusion-aware
+  walker as startup) and forwards PDMC-bearing subdirs onto the Stage 8
+  `newDirs` channel, so dedup + `w.Add` + `BaselineScan` happen on the main
+  select goroutine — no new shared state. Default target is `$PWD`; a
+  positional arg overrides. Exit 2 with a friendly "daemon is not running"
+  message when the socket is absent.
+- `pdmcguard untrack <path>` — CLI alias for `exclude`. Symmetric verb pair
+  for discoverability; implemented as a single switch-case dispatch so there's
+  no behavioral divergence from the existing exclude path.
+- `pdmcguard doctor` gained an `ipc` check. OK when Dial succeeds, WARN when
+  the socket is absent (matches credentials' offline classification so
+  `install && doctor` pipelines survive a pre-start machine), FAIL only on
+  stale-socket refusals (`ECONNREFUSED`). `--verbose` prints the socket path.
+- `pdmcguard status` now reports `IPC: listening at …` (stat-only; doctor is
+  where liveness is verified).
+- `daemon.Listen(ctx, path, handler) / daemon.Dial(path) / daemon.SendRequest /
+  daemon.SocketPath` — minimal server-side IPC primitives. Stale-socket
+  recovery at bind time (`syscall.Unlink` first), 30s per-connection
+  deadlines, one request per connection. Designed for future ops
+  (`reload`, `status`, …) without protocol surgery.
 - Runtime project discovery: projects cloned or created after the daemon
   starts are now tracked without a restart. Two mechanisms compose —
   fsnotify-level "root watch" on every scan root for the fast path

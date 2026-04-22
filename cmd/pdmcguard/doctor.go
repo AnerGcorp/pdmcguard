@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,6 +77,11 @@ type doctorDeps struct {
 	sentinelPath func() string
 	// inspectExcludes wraps excludes.Inspect.
 	inspectExcludes func(string) (excludes.InspectResult, error)
+	// socketPath returns the daemon IPC socket location.
+	socketPath func() string
+	// dialIPC attempts a connection to the IPC socket. Returning a
+	// non-nil net.Conn means a listener accepted; the caller closes.
+	dialIPC func(string) (net.Conn, error)
 }
 
 // queueHandle is the subset of *sync.Queue that doctor needs. Declared
@@ -119,6 +125,8 @@ func defaultDoctorDeps() doctorDeps {
 		},
 		sentinelPath:    sync.AlertSentinelFile,
 		inspectExcludes: excludes.Inspect,
+		socketPath:      daemon.SocketPath,
+		dialIPC:         daemon.Dial,
 	}
 }
 
@@ -165,6 +173,7 @@ func runDoctor(out io.Writer, deps doctorDeps, verbose bool) int {
 		checkQueue(deps),
 		checkSentinel(deps),
 		checkExcludes(deps),
+		checkIPC(deps),
 	}
 
 	colorize := isTTYWriter(out)
@@ -655,5 +664,54 @@ func checkExcludes(d doctorDeps) checkResult {
 		name:    "excludes",
 		status:  statusOK,
 		message: fmt.Sprintf("%d rules, 0 skipped", res.ParsedRules),
+	}
+}
+
+// checkIPC verifies the daemon IPC surface. Three dispositions:
+//
+//   - OK: socket exists and Dial succeeds — daemon is listening.
+//   - WARN: socket missing entirely — daemon not running. Matches
+//     checkCredentials' offline classification so `install && doctor`
+//     pipelines don't break on a pre-start machine.
+//   - FAIL: socket present but refuses connections — a stale file from
+//     a prior crash that the daemon hasn't reclaimed. Actionable: a
+//     service restart fixes it.
+func checkIPC(d doctorDeps) checkResult {
+	path := d.socketPath()
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return checkResult{
+				name:    "ipc",
+				status:  statusWarn,
+				message: "daemon not running (no socket at " + path + ")",
+			}
+		}
+		return checkResult{
+			name:    "ipc",
+			status:  statusFail,
+			message: fmt.Sprintf("socket stat: %v", err),
+		}
+	}
+	conn, err := d.dialIPC(path)
+	if err != nil {
+		if errors.Is(err, daemon.ErrDaemonNotRunning) {
+			return checkResult{
+				name:    "ipc",
+				status:  statusFail,
+				message: "stale socket — restart the daemon",
+				detail:  path,
+			}
+		}
+		return checkResult{
+			name:    "ipc",
+			status:  statusFail,
+			message: fmt.Sprintf("dial: %v", err),
+		}
+	}
+	conn.Close()
+	return checkResult{
+		name:    "ipc",
+		status:  statusOK,
+		message: "listening at " + path,
 	}
 }

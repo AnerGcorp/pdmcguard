@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -94,6 +95,17 @@ func main() {
 
 		case "unexclude":
 			cmdUnexclude(filteredArgs[1:])
+			return
+
+		case "track":
+			cmdTrack(filteredArgs[1:])
+			return
+
+		case "untrack":
+			// CLI alias for `exclude`. The symmetric verb pair is the
+			// primary discoverability win; a genuine runtime-only untrack
+			// would self-heal on the next rescan, confusing users.
+			cmdExclude(filteredArgs[1:])
 			return
 
 		case "doctor":
@@ -272,6 +284,57 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 		}
 	}()
 
+	// Producer C — explicit IPC. `pdmcguard track <path>` dials the
+	// daemon's Unix-domain socket and enqueues a path for tracking
+	// immediately, independent of the fsnotify fast path and the
+	// periodic rescan. Handler runs ScanOne (same exclusion-aware
+	// walker) and forwards hits onto newDirs so dedup + w.Add +
+	// BaselineScan happen on the main select goroutine — no new shared
+	// state. Listener lifetime is tied to ctx; a bind failure logs and
+	// the daemon keeps running without the IPC surface.
+	ipcHandler := func(_ context.Context, req daemon.Request) daemon.Response {
+		switch req.Op {
+		case "track":
+			if req.Path == "" {
+				return daemon.Response{Error: "track: path is required"}
+			}
+			abs, err := filepath.Abs(req.Path)
+			if err != nil {
+				return daemon.Response{Error: fmt.Sprintf("track: %v", err)}
+			}
+			if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+				abs = resolved
+			}
+			abs = filepath.Clean(abs)
+			if info, err := os.Stat(abs); err != nil || !info.IsDir() {
+				return daemon.Response{Error: fmt.Sprintf("track: %s: not a directory", abs)}
+			}
+			found, err := bootstrap.ScanOne(store, matcher, abs)
+			if err != nil {
+				return daemon.Response{Error: fmt.Sprintf("track: scan: %v", err)}
+			}
+			for _, d := range found {
+				select {
+				case newDirs <- d:
+				case <-ctx.Done():
+					return daemon.Response{Error: "daemon shutting down"}
+				}
+			}
+			msg := fmt.Sprintf("queued %d project(s) under %s", len(found), abs)
+			if len(found) == 0 {
+				msg = fmt.Sprintf("no PDMC files under %s", abs)
+			}
+			return daemon.Response{OK: true, Found: len(found), Message: msg}
+		default:
+			return daemon.Response{Error: fmt.Sprintf("unknown op %q", req.Op)}
+		}
+	}
+	go func() {
+		if err := daemon.Listen(ctx, daemon.SocketPath(), ipcHandler); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: ipc listener: %v\n", err)
+		}
+	}()
+
 	// Producer B — safety net. A low-frequency full rescan picks up
 	// edges fsnotify loses under burst load (huge `git clone`), atomic
 	// renames, and tools that write files into dirs we never got a
@@ -407,6 +470,15 @@ func cmdStatus() {
 		}
 	}
 
+	// IPC socket — stat-only check. Status stays fast and never hangs
+	// on a pathological socket; `pdmcguard doctor` is where liveness is
+	// actually verified with a dial.
+	if _, err := os.Stat(daemon.SocketPath()); err == nil {
+		fmt.Printf("IPC:         listening at %s\n", daemon.SocketPath())
+	} else {
+		fmt.Println("IPC:         daemon not running")
+	}
+
 	// Show queue depth
 	q, err := sync.OpenQueue(config.FilePath("queue.db"))
 	if err == nil {
@@ -435,6 +507,8 @@ Usage:
   pdmcguard unack <id>      Reverse a prior ack (--all-projects for global)
   pdmcguard exclude <path>  Skip a path or basename from scans (--list to show rules)
   pdmcguard unexclude <path>  Remove a previously-added exclusion rule
+  pdmcguard track [path]    Register a path with the running daemon (default: cwd)
+  pdmcguard untrack <path>  Alias for 'exclude' — stop tracking a path
   pdmcguard doctor          Run a health check across install, cache, and config
   pdmcguard version         Print version information
 
