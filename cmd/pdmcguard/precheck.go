@@ -7,6 +7,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/AnerGcorp/pdmcguard/internal/cache"
@@ -17,9 +18,44 @@ import (
 
 const maxAlertsShown = 5
 
+// preCheckStore is the subset of cache.Store that precheck.go needs.
+// Declaring it as an interface lets tests inject an in-memory fake and
+// verify the call order (CriticalAlerts → printWarning → MarkShown)
+// without touching SQLite or the filesystem.
+type preCheckStore interface {
+	CriticalAlerts(projectDir string) ([]cache.Alert, error)
+	MarkShown(projectDir string) error
+	Close() error
+}
+
+// openPreCheckStore is the production path for obtaining the cache.
+// Tests replace this function with one returning a fake store.
+var openPreCheckStore = func() (preCheckStore, error) {
+	dbPath := config.FilePath("cache.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil, os.ErrNotExist
+	}
+	s, err := cache.Open(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// stderrIsTTY reports whether the warning should be written to stderr.
+// Declared as a variable so tests can force the non-TTY branch.
+var stderrIsTTY = func() bool {
+	fd := os.Stderr.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
+}
+
 // cmdPreCheck checks the current project for critical advisories.
-// Returns 0 if clean, 1 if critical advisories found.
+// Returns 0 if clean, 1 if critical advisories were shown.
 func cmdPreCheck() int {
+	return runPreCheck(os.Stderr)
+}
+
+func runPreCheck(out io.Writer) int {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return 0
@@ -33,12 +69,7 @@ func cmdPreCheck() int {
 		return 0
 	}
 
-	dbPath := config.FilePath("cache.db")
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return 0 // cache not yet created — silent
-	}
-
-	store, err := cache.Open(dbPath)
+	store, err := openPreCheckStore()
 	if err != nil {
 		return 0
 	}
@@ -49,23 +80,30 @@ func cmdPreCheck() int {
 		return 0
 	}
 
-	printWarning(projectDir, alerts)
+	// Gate the entire print on a TTY stderr. Before this, the banner
+	// leaked into CI logs, piped output, and any non-interactive shell
+	// that happened to source .zshrc.
+	if !stderrIsTTY() {
+		return 0
+	}
+
+	printWarning(out, projectDir, alerts)
+
+	// Start the 24h quiet window. Failure to mark is non-fatal — worst
+	// case the banner reprints on the next directory change, which is
+	// still better than the pre-fix every-prompt spam.
+	_ = store.MarkShown(projectDir)
 	return 1
 }
 
-func printWarning(projectDir string, alerts []cache.Alert) {
-	isTTY := isatty.IsTerminal(os.Stderr.Fd()) || isatty.IsCygwinTerminal(os.Stderr.Fd())
-
-	yellow := ""
-	reset := ""
-	bold := ""
-	if isTTY {
+func printWarning(out io.Writer, projectDir string, alerts []cache.Alert) {
+	const (
 		yellow = "\033[33m"
-		reset = "\033[0m"
-		bold = "\033[1m"
-	}
+		reset  = "\033[0m"
+		bold   = "\033[1m"
+	)
 
-	fmt.Fprintf(os.Stderr, "%s%s⚠ pdmcguard: %d critical advisor%s in %s%s\n",
+	fmt.Fprintf(out, "%s%s⚠ pdmcguard: %d critical advisor%s in %s%s\n",
 		yellow, bold, len(alerts), plural(len(alerts)), projectDir, reset)
 
 	shown := len(alerts)
@@ -77,12 +115,12 @@ func printWarning(projectDir string, alerts []cache.Alert) {
 		if summary == "" {
 			summary = a.Severity
 		}
-		fmt.Fprintf(os.Stderr, "  • %s (%s): %s\n", a.PackageName, a.AdvisoryID, summary)
+		fmt.Fprintf(out, "  • %s (%s): %s\n", a.PackageName, a.AdvisoryID, summary)
 	}
 	if len(alerts) > maxAlertsShown {
-		fmt.Fprintf(os.Stderr, "  ... and %d more\n", len(alerts)-maxAlertsShown)
+		fmt.Fprintf(out, "  ... and %d more\n", len(alerts)-maxAlertsShown)
 	}
-	fmt.Fprintf(os.Stderr, "Run 'pdmcguard status' for details.\n")
+	fmt.Fprintf(out, "Run 'pdmcguard status' for details.\n")
 }
 
 func plural(n int) string {

@@ -80,3 +80,50 @@ func TestFindProjectDir_NoProject(t *testing.T) {
 		t.Errorf("expected ErrNoProject, got %v", err)
 	}
 }
+
+// TestFindProjectDir_StopsAtHome guards against the "every new terminal
+// prints the banner" regression. With a stray package.json in $HOME and a
+// subdirectory without any PDMC file, FindProjectDir must report
+// ErrNoProject — not bubble up and match $HOME.
+func TestFindProjectDir_StopsAtHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	// Stray lockfile-ish marker directly in $HOME (common real-world accident).
+	os.WriteFile(filepath.Join(home, "package.json"), []byte("{}"), 0o644)
+
+	// User's actual cwd — a subdir of $HOME with no PDMC files.
+	sub := filepath.Join(home, "projects", "scratch")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := FindProjectDir(sub)
+	if !errors.Is(err, ErrNoProject) {
+		t.Errorf("expected ErrNoProject (walk should stop at $HOME), got err=%v", err)
+	}
+}
+
+// TestFindProjectDir_MatchesProjectUnderHome ensures the $HOME bailout
+// does not break the common case of a real project beneath $HOME.
+func TestFindProjectDir_MatchesProjectUnderHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	proj := filepath.Join(home, "code", "myapp")
+	if err := os.MkdirAll(proj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module myapp"), 0o644)
+
+	sub := filepath.Join(proj, "internal")
+	os.MkdirAll(sub, 0o755)
+
+	dir, err := FindProjectDir(sub)
+	if err != nil {
+		t.Fatalf("expected to find project under $HOME, got err=%v", err)
+	}
+	if dir != proj {
+		t.Errorf("expected %s, got %s", proj, dir)
+	}
+}

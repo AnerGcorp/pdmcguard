@@ -8,20 +8,27 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
+// QuietWindow is how long a critical alert is suppressed after being shown
+// once in a terminal. Prevents the shell hook from re-printing on every
+// directory change within the same day.
+const QuietWindow = 24 * time.Hour
+
 const cacheSchema = `
 CREATE TABLE IF NOT EXISTS project_alerts (
-	project_dir  TEXT NOT NULL,
-	advisory_id  TEXT NOT NULL,
-	package_name TEXT NOT NULL,
-	ecosystem    TEXT NOT NULL,
-	severity     TEXT NOT NULL,
-	summary      TEXT NOT NULL DEFAULT '',
-	updated_at   TEXT NOT NULL,
+	project_dir   TEXT NOT NULL,
+	advisory_id   TEXT NOT NULL,
+	package_name  TEXT NOT NULL,
+	ecosystem     TEXT NOT NULL,
+	severity      TEXT NOT NULL,
+	summary       TEXT NOT NULL DEFAULT '',
+	updated_at    TEXT NOT NULL,
+	last_shown_at TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (project_dir, advisory_id)
 );
 
@@ -111,6 +118,15 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
+	// Additive migration for caches created before last_shown_at existed.
+	// SQLite returns "duplicate column name" when the column is already
+	// present — that's the expected no-op path and is ignored.
+	if _, err := db.Exec(`ALTER TABLE project_alerts ADD COLUMN last_shown_at TEXT NOT NULL DEFAULT ''`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("migrate last_shown_at: %w", err)
+		}
+	}
 	return &Store{db: db}, nil
 }
 
@@ -119,14 +135,21 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// CriticalAlerts returns all critical-severity alerts for a project directory.
+// CriticalAlerts returns critical-severity alerts for a project directory
+// that have not been shown in a terminal within the quiet window (24h).
+// Once MarkShown has been called for the project, subsequent calls return
+// an empty slice until the window elapses — this is what stops the shell
+// hook from re-printing the same banner every prompt.
 func (s *Store) CriticalAlerts(projectDir string) ([]Alert, error) {
+	cutoff := time.Now().UTC().Add(-QuietWindow).Format(time.RFC3339)
 	rows, err := s.db.Query(
 		`SELECT advisory_id, package_name, ecosystem, severity, summary
 		 FROM project_alerts
-		 WHERE project_dir = ? AND severity = 'critical'
+		 WHERE project_dir = ?
+		   AND severity = 'critical'
+		   AND (last_shown_at = '' OR last_shown_at < ?)
 		 ORDER BY package_name`,
-		projectDir,
+		projectDir, cutoff,
 	)
 	if err != nil {
 		return nil, err
@@ -144,11 +167,49 @@ func (s *Store) CriticalAlerts(projectDir string) ([]Alert, error) {
 	return alerts, rows.Err()
 }
 
-// UpsertProjectAlert inserts or replaces a project alert.
+// MarkShown stamps all critical alerts for projectDir with the current time.
+// Call this after successfully printing the shell-hook warning to start the
+// 24h quiet window (see CriticalAlerts).
+func (s *Store) MarkShown(projectDir string) error {
+	_, err := s.db.Exec(
+		`UPDATE project_alerts
+		 SET last_shown_at = ?
+		 WHERE project_dir = ? AND severity = 'critical'`,
+		time.Now().UTC().Format(time.RFC3339), projectDir,
+	)
+	return err
+}
+
+// HasAnyCritical reports whether any critical alert exists anywhere in the
+// cache, across all projects. The sync engine uses this to maintain a
+// zero-cost sentinel file (alerts.flag) that the shell hook can stat() to
+// avoid forking the Go binary when there's nothing to show on the machine.
+func (s *Store) HasAnyCritical() (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM project_alerts WHERE severity = 'critical'`,
+	).Scan(&n)
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+// UpsertProjectAlert inserts a new project alert or updates an existing one.
+// Uses ON CONFLICT DO UPDATE (not INSERT OR REPLACE) so that last_shown_at is
+// preserved across re-syncs — otherwise every advisory pull would reset the
+// quiet window and the shell hook would re-print on the next prompt.
 func (s *Store) UpsertProjectAlert(pa ProjectAlert) error {
 	_, err := s.db.Exec(
-		`INSERT OR REPLACE INTO project_alerts (project_dir, advisory_id, package_name, ecosystem, severity, summary, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO project_alerts
+		   (project_dir, advisory_id, package_name, ecosystem, severity, summary, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(project_dir, advisory_id) DO UPDATE SET
+		   package_name = excluded.package_name,
+		   ecosystem    = excluded.ecosystem,
+		   severity     = excluded.severity,
+		   summary      = excluded.summary,
+		   updated_at   = excluded.updated_at`,
 		pa.ProjectDir, pa.AdvisoryID, pa.PackageName, pa.Ecosystem, pa.Severity, pa.Summary,
 		time.Now().UTC().Format(time.RFC3339),
 	)

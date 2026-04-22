@@ -216,6 +216,11 @@ func (e *Engine) syncProject(projectDir, lockPath, ecosystem, branch, commit, re
 		}
 	}
 
+	// 4b. Maintain the shell-hook sentinel file. The hook stat()s this
+	// before forking the Go binary — keeps prompt latency at zero when
+	// there's nothing to warn about on the machine.
+	e.updateAlertSentinel()
+
 	// 5. Update content hash and sync time
 	_ = e.cache.SetMeta(metaKey(projectDir), contentHash)
 	_ = e.cache.SetMeta("last_full_sync", time.Now().UTC().Format(time.RFC3339))
@@ -261,6 +266,29 @@ func (e *Engine) drainQueue() {
 		e.syncProject(item.ProjectDir, item.LockPath, item.Ecosystem,
 			item.GitBranch, item.GitCommit, "", contentHash, pkgs, "watcher")
 	}
+}
+
+// AlertSentinelFile returns the path of the file that signals to the shell
+// hook whether any critical alerts exist in the local cache.
+func AlertSentinelFile() string {
+	return config.FilePath("alerts.flag")
+}
+
+// updateAlertSentinel writes or removes ~/.pdmcguard/alerts.flag so the
+// shell hook can decide without forking whether there is anything worth
+// re-checking. Errors are swallowed — a missing or stale sentinel only
+// costs one redundant binary invocation; it cannot produce false alerts.
+func (e *Engine) updateAlertSentinel() {
+	path := AlertSentinelFile()
+	hasAny, err := e.cache.HasAnyCritical()
+	if err != nil {
+		return
+	}
+	if hasAny {
+		_ = os.WriteFile(path, []byte(""), 0o644)
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

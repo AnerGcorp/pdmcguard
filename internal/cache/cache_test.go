@@ -5,7 +5,9 @@
 package cache
 
 import (
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,5 +177,190 @@ func TestEmptyCacheReturnsNil(t *testing.T) {
 	}
 	if alerts != nil {
 		t.Errorf("expected nil for empty cache, got %v", alerts)
+	}
+}
+
+// TestCriticalAlerts_RespectsQuietWindow verifies the 24h suppression
+// introduced to stop the shell hook from re-printing the same banner on
+// every prompt. After MarkShown, CriticalAlerts should return empty until
+// last_shown_at ages past the quiet window.
+func TestCriticalAlerts_RespectsQuietWindow(t *testing.T) {
+	store := openTestStore(t)
+
+	store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir:  "/proj",
+		AdvisoryID:  "GHSA-1111",
+		PackageName: "litellm",
+		Ecosystem:   "pypi",
+		Severity:    "critical",
+		Summary:     "exposed token",
+	})
+
+	// First read: should return the alert (never shown before).
+	alerts, err := store.CriticalAlerts("/proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert before MarkShown, got %d", len(alerts))
+	}
+
+	// After MarkShown, the quiet window begins — next read is empty.
+	if err := store.MarkShown("/proj"); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _ = store.CriticalAlerts("/proj")
+	if len(alerts) != 0 {
+		t.Fatalf("expected 0 alerts inside quiet window, got %d", len(alerts))
+	}
+
+	// Age last_shown_at past the window and re-read — should reappear.
+	old := time.Now().UTC().Add(-25 * time.Hour).Format(time.RFC3339)
+	if _, err := store.db.Exec(
+		`UPDATE project_alerts SET last_shown_at = ? WHERE project_dir = ?`, old, "/proj",
+	); err != nil {
+		t.Fatal(err)
+	}
+	alerts, _ = store.CriticalAlerts("/proj")
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert after quiet window expires, got %d", len(alerts))
+	}
+}
+
+// TestUpsertPreservesLastShownAt guards against a subtle regression: if
+// UpsertProjectAlert used INSERT OR REPLACE instead of UPSERT-with-preserve,
+// every daemon re-sync would reset the quiet window and the hook would
+// spam again on the next prompt.
+func TestUpsertPreservesLastShownAt(t *testing.T) {
+	store := openTestStore(t)
+
+	pa := ProjectAlert{
+		ProjectDir:  "/proj",
+		AdvisoryID:  "GHSA-2222",
+		PackageName: "lodash",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "old",
+	}
+	store.UpsertProjectAlert(pa)
+	store.MarkShown("/proj")
+
+	// Re-upsert (simulates a daemon re-sync).
+	pa.Summary = "new"
+	store.UpsertProjectAlert(pa)
+
+	// Alert should stay suppressed by the original MarkShown.
+	alerts, _ := store.CriticalAlerts("/proj")
+	if len(alerts) != 0 {
+		t.Errorf("expected upsert to preserve last_shown_at (got %d alerts)", len(alerts))
+	}
+
+	// And the summary should still be updated (upsert still writes the row).
+	var summary string
+	if err := store.db.QueryRow(
+		`SELECT summary FROM project_alerts WHERE project_dir = ? AND advisory_id = ?`,
+		"/proj", "GHSA-2222",
+	).Scan(&summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary != "new" {
+		t.Errorf("expected summary 'new', got %q", summary)
+	}
+}
+
+// TestHasAnyCritical exercises the signal the sync engine uses to
+// write/remove the ~/.pdmcguard/alerts.flag sentinel file.
+func TestHasAnyCritical(t *testing.T) {
+	store := openTestStore(t)
+
+	any, err := store.HasAnyCritical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if any {
+		t.Error("expected false for empty cache")
+	}
+
+	store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir: "/a", AdvisoryID: "X", PackageName: "p",
+		Ecosystem: "npm", Severity: "critical",
+	})
+	if any, _ = store.HasAnyCritical(); !any {
+		t.Error("expected true after inserting a critical alert")
+	}
+
+	// Non-critical row alone should not flip the signal.
+	store.ClearProjectAlerts("/a")
+	store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir: "/a", AdvisoryID: "Y", PackageName: "p",
+		Ecosystem: "npm", Severity: "high",
+	})
+	if any, _ = store.HasAnyCritical(); any {
+		t.Error("expected false when only non-critical rows remain")
+	}
+}
+
+// TestMigration_LastShownAtColumnAdded opens a DB created under the old
+// schema (no last_shown_at column) and verifies that Open() applies the
+// additive migration without touching existing rows.
+func TestMigration_LastShownAtColumnAdded(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "old.db")
+
+	// Simulate the pre-migration schema.
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`
+		CREATE TABLE project_alerts (
+			project_dir  TEXT NOT NULL,
+			advisory_id  TEXT NOT NULL,
+			package_name TEXT NOT NULL,
+			ecosystem    TEXT NOT NULL,
+			severity     TEXT NOT NULL,
+			summary      TEXT NOT NULL DEFAULT '',
+			updated_at   TEXT NOT NULL,
+			PRIMARY KEY (project_dir, advisory_id)
+		);
+		INSERT INTO project_alerts VALUES ('/old', 'A', 'pkg', 'npm', 'critical', '', '2026-01-01T00:00:00Z');
+	`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+
+	// Re-open through the real constructor — migration should run.
+	store, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open should migrate cleanly: %v", err)
+	}
+	defer store.Close()
+
+	// Column must now exist.
+	rows, err := store.db.Query(`PRAGMA table_info(project_alerts)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var found bool
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			t.Fatal(err)
+		}
+		if strings.EqualFold(name, "last_shown_at") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("migration did not add last_shown_at column")
+	}
+
+	// Existing row must survive untouched.
+	alerts, _ := store.CriticalAlerts("/old")
+	if len(alerts) != 1 {
+		t.Errorf("expected 1 pre-existing alert post-migration, got %d", len(alerts))
 	}
 }
