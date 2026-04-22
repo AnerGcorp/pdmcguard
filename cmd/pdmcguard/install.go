@@ -34,6 +34,16 @@ func cmdInstall(args []string) {
 	}
 	srcBin, _ = filepath.EvalSymlinks(srcBin)
 
+	// Pre-flight: refuse to publish a corrupt source. A bad `go build -o`
+	// can silently produce a 0-byte file, a partial scp leaves a non-exec
+	// artifact — either way, copying it would brick the install while
+	// reporting success. Size + exec bit catches both without the cost of
+	// subprocessing the source (hangs, timeouts, process-tree surprises).
+	if err := verifyBinary(srcBin); err != nil {
+		fmt.Fprintf(os.Stderr, "error: source binary is corrupt: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 2. Copy binary to ~/.pdmcguard/bin/pdmcguard
 	destDir := filepath.Join(config.Dir(), "bin")
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
@@ -86,6 +96,24 @@ func cmdInstall(args []string) {
 	fmt.Println("  1. Open a new terminal (or run: source " + daemon.ShellRCPath(daemon.DetectShell()) + ")")
 	fmt.Println("  2. Run: pdmcguard login")
 	fmt.Println("  3. Navigate to a project — PDMCGuard will warn about critical advisories")
+}
+
+// verifyBinary sanity-checks the source file before a copy. Catches two
+// real-world failure modes: 0-byte output from a silently failed `go build`
+// and non-executable artifacts from partial transfers. Kept deliberately
+// cheap (no subprocess) so it can never hang the install.
+func verifyBinary(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	if info.Size() == 0 {
+		return fmt.Errorf("%s is 0 bytes", path)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%s is not executable (mode %v)", path, info.Mode())
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {
