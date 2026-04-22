@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/AnerGcorp/pdmcguard/internal/bootstrap"
 	"github.com/AnerGcorp/pdmcguard/internal/cache"
@@ -161,6 +162,12 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 	}
 	defer w.Close()
 
+	// trackedDirs is the authoritative set of project directories the
+	// daemon is watching and has classified at least once. Written only
+	// from this goroutine's select loop (below) so no mutex is needed —
+	// producer goroutines send paths on newDirs, we dedup here.
+	trackedDirs := make(map[string]bool, len(dirs))
+
 	for _, d := range dirs {
 		added, err := w.Add(d)
 		if err != nil {
@@ -169,6 +176,19 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 		}
 		if !added {
 			fmt.Printf("  skipped (excluded): %s\n", d)
+			continue
+		}
+		trackedDirs[d] = true
+	}
+
+	// Register each scan root for runtime-discovery fast-path: Create
+	// events for new children under roots flow back via w.RootCreates.
+	// Failure here is not fatal — the periodic rescan (below) still
+	// converges. Roots aren't de-duplicated against `dirs` because
+	// watching the same inode twice in fsnotify is a no-op.
+	for _, root := range roots {
+		if err := w.WatchRoot(root); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: watch root %s: %v\n", root, err)
 		}
 	}
 
@@ -226,6 +246,67 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 			stats.Total, stats.Classified, stats.Skipped)
 	}
 
+	// newDirs carries runtime-discovered project directories to the main
+	// select below. Two producer goroutines feed it: the fast path
+	// consuming w.RootCreates, and the periodic rescan ticker.
+	newDirs := make(chan string, 32)
+
+	// Producer A — fast path. For every new child of a watched root,
+	// shallow-scan via bootstrap.ScanOne and forward any PDMC-bearing
+	// subdirs. ScanOne is the same exclusion-aware walker used at startup,
+	// so `node_modules`, user excludes, classifier fingerprints, and
+	// hidden dirs are all filtered before we touch newDirs.
+	go func() {
+		for created := range w.RootCreates {
+			found, err := bootstrap.ScanOne(store, matcher, created)
+			if err != nil {
+				continue
+			}
+			for _, d := range found {
+				select {
+				case newDirs <- d:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+
+	// Producer B — safety net. A low-frequency full rescan picks up
+	// edges fsnotify loses under burst load (huge `git clone`), atomic
+	// renames, and tools that write files into dirs we never got a
+	// Create event for. Default 5m; PDMCGUARD_RESCAN_INTERVAL=<dur>
+	// overrides (0 disables). Already-tracked dirs are filtered by the
+	// consumer, and BaselineScan's content-hash dedup makes reclassifying
+	// unchanged lockfiles a cheap local lookup.
+	rescanEvery := parseRescanInterval(os.Getenv("PDMCGUARD_RESCAN_INTERVAL"), 5*time.Minute)
+	if rescanEvery > 0 {
+		go func() {
+			t := time.NewTicker(rescanEvery)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					for _, root := range roots {
+						found, err := bootstrap.ScanOne(store, matcher, root)
+						if err != nil {
+							continue
+						}
+						for _, d := range found {
+							select {
+							case newDirs <- d:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	fmt.Println("Watching for PDMC file changes... (Ctrl+C to stop)")
 
 	// Handle signals for clean shutdown
@@ -245,14 +326,53 @@ func runDaemon(extraRoots []string, noBaseline bool) {
 				fmt.Printf("[change] %s (%s)\n", ev.Path, ev.Ecosystem)
 			}
 			syncEngine.HandleChange(ev, gitInfo, "watcher")
+		case d := <-newDirs:
+			// Runtime-discovered project: skip if already tracked, else
+			// watch it, mark tracked, and run a one-shot baseline so any
+			// existing advisories surface immediately (pre-check is
+			// accurate on the first cd into the new repo).
+			if trackedDirs[d] {
+				continue
+			}
+			added, addErr := w.Add(d)
+			if addErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: watch %s: %v\n", d, addErr)
+				continue
+			}
+			if !added {
+				continue
+			}
+			trackedDirs[d] = true
+			fmt.Printf("[discovered] %s\n", d)
+			syncEngine.BaselineScan([]string{d}, gitReader)
 		case err := <-w.Errors:
 			fmt.Fprintf(os.Stderr, "[error] %v\n", err)
 		case <-sig:
 			fmt.Println("\nShutting down...")
-			cancel() // Stop SSE listener
+			cancel() // Stop SSE listener + producer goroutines
 			return
 		}
 	}
+}
+
+// parseRescanInterval parses the PDMCGUARD_RESCAN_INTERVAL env-var value.
+// Accepts Go duration syntax ("5m", "30s") plus the literal "0" / "off" /
+// "false" as a disable. Unparseable values fall back to def with a stderr
+// note so the user notices a typo instead of silently getting the default.
+func parseRescanInterval(raw string, def time.Duration) time.Duration {
+	if raw == "" {
+		return def
+	}
+	switch raw {
+	case "0", "off", "false":
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: PDMCGUARD_RESCAN_INTERVAL=%q not a duration; using default %s\n", raw, def)
+		return def
+	}
+	return d
 }
 
 func cmdStatus() {

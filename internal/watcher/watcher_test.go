@@ -155,6 +155,114 @@ func TestWatcher_AddHonorsMatcher(t *testing.T) {
 	}
 }
 
+// TestWatchRoot_EmitsOnCreate verifies the runtime-discovery fast path:
+// after registering a root, creating a new child directory should surface
+// on RootCreates within one event tick. This is the signal runDaemon
+// consumes to discover repos cloned after daemon start.
+func TestWatchRoot_EmitsOnCreate(t *testing.T) {
+	w, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	root := t.TempDir()
+	if err := w.WatchRoot(root); err != nil {
+		t.Fatalf("WatchRoot: %v", err)
+	}
+
+	newDir := filepath.Join(root, "new-project")
+	if err := os.Mkdir(newDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-w.RootCreates:
+		if got != newDir {
+			t.Errorf("RootCreates = %q, want %q", got, newDir)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RootCreates event")
+	}
+}
+
+// TestWatchRoot_IgnoresHiddenDirs: `.git`, `.cache`, and similar dot-dirs
+// should NOT trigger a RootCreates event. Bootstrap's walk filters them
+// anyway, but filtering here keeps the channel signal-to-noise high when
+// a user's tools create scratch dirs alongside projects.
+func TestWatchRoot_IgnoresHiddenDirs(t *testing.T) {
+	w, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	root := t.TempDir()
+	if err := w.WatchRoot(root); err != nil {
+		t.Fatal(err)
+	}
+
+	hidden := filepath.Join(root, ".tmp-scratch")
+	if err := os.Mkdir(hidden, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-w.RootCreates:
+		t.Errorf("unexpected RootCreates for hidden dir: %q", got)
+	case <-time.After(800 * time.Millisecond):
+		// expected silence
+	}
+}
+
+// TestWatchRoot_DoesNotEmitForFiles: a stray file at the root (e.g. a
+// README or a README.draft.md) is not a project. The stat-based filter
+// in loop() should drop it so the consumer doesn't waste a ScanOne walk.
+func TestWatchRoot_DoesNotEmitForFiles(t *testing.T) {
+	w, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	root := t.TempDir()
+	if err := w.WatchRoot(root); err != nil {
+		t.Fatal(err)
+	}
+
+	f := filepath.Join(root, "NOTES.md")
+	if err := os.WriteFile(f, []byte("hi"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case got := <-w.RootCreates:
+		t.Errorf("unexpected RootCreates for file: %q", got)
+	case <-time.After(800 * time.Millisecond):
+		// expected: file creates don't fire the root-watch path
+	}
+}
+
+// TestWatchRoot_Idempotent: calling WatchRoot twice for the same path
+// returns nil without re-adding to fsnotify (which would return
+// ErrEventOverflow on some platforms). Guards against a future refactor
+// that moves the idempotency check out.
+func TestWatchRoot_Idempotent(t *testing.T) {
+	w, err := New(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+
+	root := t.TempDir()
+	if err := w.WatchRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.WatchRoot(root); err != nil {
+		t.Errorf("second WatchRoot should be no-op, got %v", err)
+	}
+}
+
 // TestWatcher_LoopFiltersMatcher exercises the defensive event-loop
 // filter: even if a directory was Add'd before a rule existed, a
 // subsequent rule write suppresses the event at the loop boundary.

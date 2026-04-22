@@ -6,7 +6,10 @@
 package watcher
 
 import (
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
@@ -25,15 +28,27 @@ type PDMCChangeEvent struct {
 }
 
 // Watcher watches project directories for PDMC file changes.
+//
+// RootCreates emits the absolute path of every new, non-hidden direct child
+// of a directory registered via WatchRoot. It is the fast-path discovery
+// signal for `runDaemon`: when a user `git clone`s into `~/Projects/`, the
+// daemon sees the new directory here without waiting for a full rescan.
+// The channel is buffered; if a producer can't enqueue (consumer slow or
+// absent) the event is dropped on the floor rather than blocking the
+// fsnotify loop — the periodic rescan is the safety net for dropped sends.
 type Watcher struct {
-	Events chan PDMCChangeEvent
-	Errors chan error
+	Events      chan PDMCChangeEvent
+	Errors      chan error
+	RootCreates chan string
 
-	fsw      *fsnotify.Watcher
-	store    *classifier.ExcludeStore
-	matcher  *excludes.Matcher
-	deb      *debouncer
-	done     chan struct{}
+	fsw     *fsnotify.Watcher
+	store   *classifier.ExcludeStore
+	matcher *excludes.Matcher
+	deb     *debouncer
+	done    chan struct{}
+
+	rootMu  sync.RWMutex
+	rootSet map[string]bool
 }
 
 // New creates a Watcher backed by fsnotify. The ExcludeStore is used to skip
@@ -49,12 +64,14 @@ func New(store *classifier.ExcludeStore, matcher *excludes.Matcher) (*Watcher, e
 	}
 
 	w := &Watcher{
-		Events:  make(chan PDMCChangeEvent, 64),
-		Errors:  make(chan error, 8),
-		fsw:     fsw,
-		store:   store,
-		matcher: matcher,
-		done:    make(chan struct{}),
+		Events:      make(chan PDMCChangeEvent, 64),
+		Errors:      make(chan error, 8),
+		RootCreates: make(chan string, 32),
+		fsw:         fsw,
+		store:       store,
+		matcher:     matcher,
+		done:        make(chan struct{}),
+		rootSet:     make(map[string]bool),
 	}
 
 	w.deb = newDebouncer(debounceQuiet, func(path string) {
@@ -79,6 +96,42 @@ func New(store *classifier.ExcludeStore, matcher *excludes.Matcher) (*Watcher, e
 
 	go w.loop()
 	return w, nil
+}
+
+// WatchRoot registers root as a discovery root. fsnotify Create events for
+// direct (non-hidden) children of root are forwarded on RootCreates so the
+// daemon can pick up newly-cloned projects without a full rescan.
+//
+// An already-registered root is a no-op. fsnotify.Add errors propagate.
+// The root is also added to the fsnotify watch set, but file-level events
+// inside it still flow through the normal PDMC pipeline — WatchRoot is
+// additive to the existing Add path, not a replacement.
+func (w *Watcher) WatchRoot(root string) error {
+	root = filepath.Clean(root)
+	w.rootMu.Lock()
+	already := w.rootSet[root]
+	if !already {
+		w.rootSet[root] = true
+	}
+	w.rootMu.Unlock()
+	if already {
+		return nil
+	}
+	if err := w.fsw.Add(root); err != nil {
+		w.rootMu.Lock()
+		delete(w.rootSet, root)
+		w.rootMu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// isRoot reports whether dir is a registered discovery root. Held under an
+// RLock so concurrent WatchRoot calls don't block the hot path.
+func (w *Watcher) isRoot(dir string) bool {
+	w.rootMu.RLock()
+	defer w.rootMu.RUnlock()
+	return w.rootSet[dir]
 }
 
 // Add starts watching a directory for PDMC file changes.
@@ -110,6 +163,9 @@ func (w *Watcher) Close() error {
 }
 
 func (w *Watcher) loop() {
+	// Close RootCreates on exit so consumers that range over it can
+	// terminate cleanly when the watcher is shut down.
+	defer close(w.RootCreates)
 	defer close(w.done)
 	for {
 		select {
@@ -121,6 +177,32 @@ func (w *Watcher) loop() {
 			if ev.Op&(fsnotify.Write|fsnotify.Create) == 0 {
 				continue
 			}
+
+			// Root-watch fast path: Create events for a non-hidden direct
+			// child of a registered root are forwarded on RootCreates
+			// regardless of whether the new entry is itself a PDMC file.
+			// The consumer decides (via bootstrap.ScanOne) whether the
+			// subtree is interesting — keeps watcher free of filesystem
+			// walks. We best-effort stat the path so a plain file Create
+			// (e.g. `touch ~/Projects/README`) doesn't wake the consumer,
+			// but if the stat races with a rename we emit anyway and let
+			// ScanOne drop it cheaply.
+			if ev.Op&fsnotify.Create != 0 {
+				parent := filepath.Dir(ev.Name)
+				if w.isRoot(parent) {
+					name := filepath.Base(ev.Name)
+					if !strings.HasPrefix(name, ".") {
+						if fi, statErr := os.Lstat(ev.Name); statErr != nil || fi.IsDir() {
+							select {
+							case w.RootCreates <- ev.Name:
+							default:
+								// Channel full — periodic rescan is the safety net.
+							}
+						}
+					}
+				}
+			}
+
 			base := filepath.Base(ev.Name)
 			if !IsPDMC(base) {
 				continue

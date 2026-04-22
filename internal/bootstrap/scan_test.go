@@ -9,6 +9,7 @@ package bootstrap
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/AnerGcorp/pdmcguard/internal/classifier"
@@ -105,6 +106,64 @@ func TestScan_AutoExcludesToStore(t *testing.T) {
 	}
 	if !store.IsExcluded(inode) {
 		t.Error("venv inode should have been auto-excluded during scan")
+	}
+}
+
+// TestScanOne_ParityWithScan asserts that ScanOne over a single root
+// returns the same project dirs as Scan called with that root, so the
+// runtime-discovery path (which calls ScanOne) applies identical
+// exclusion rules to the startup path (which calls Scan).
+func TestScanOne_ParityWithScan(t *testing.T) {
+	root := t.TempDir()
+
+	// Real project
+	proj := filepath.Join(root, "alpha")
+	os.MkdirAll(proj, 0o755)
+	os.WriteFile(filepath.Join(proj, "go.mod"), []byte("module a"), 0o644)
+
+	// Nested project inside a node_modules — should be excluded by
+	// the classifier layer regardless of which entry point we use.
+	nm := filepath.Join(root, "beta", "node_modules", "lib")
+	os.MkdirAll(nm, 0o755)
+	os.WriteFile(filepath.Join(nm, "package.json"), []byte("{}"), 0o644)
+
+	// Another real project at a deeper level
+	deep := filepath.Join(root, "gamma", "sub", "app")
+	os.MkdirAll(deep, 0o755)
+	os.WriteFile(filepath.Join(deep, "Cargo.toml"), []byte("[package]\n"), 0o644)
+
+	got1, err := Scan(nil, nil, []string{root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got2, err := ScanOne(nil, nil, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got1)
+	sort.Strings(got2)
+	if len(got1) != len(got2) {
+		t.Fatalf("Scan returned %d dirs, ScanOne returned %d (%v vs %v)",
+			len(got1), len(got2), got1, got2)
+	}
+	for i := range got1 {
+		if got1[i] != got2[i] {
+			t.Errorf("at index %d: Scan=%q ScanOne=%q", i, got1[i], got2[i])
+		}
+	}
+}
+
+// TestScanOne_MissingRoot: a non-existent root path must not error —
+// ScanOne is called from the periodic-rescan ticker on every configured
+// root, and an ephemerally-missing one (e.g. an unmounted external drive)
+// should degrade to an empty slice, not kill the goroutine.
+func TestScanOne_MissingRoot(t *testing.T) {
+	got, err := ScanOne(nil, nil, filepath.Join(t.TempDir(), "does-not-exist"))
+	if err != nil {
+		t.Fatalf("ScanOne on missing root returned error %v; expected empty slice", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("missing root should yield empty slice, got %v", got)
 	}
 }
 

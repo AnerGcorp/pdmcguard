@@ -10,6 +10,23 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Runtime project discovery: projects cloned or created after the daemon
+  starts are now tracked without a restart. Two mechanisms compose —
+  fsnotify-level "root watch" on every scan root for the fast path
+  (`git clone ~/Projects/foo` surfaces within ~1s), and a low-frequency
+  periodic rescan as a safety net for events fsnotify drops under burst
+  load or atomic renames. Interval defaults to 5 min; override via
+  `PDMCGUARD_RESCAN_INTERVAL=<duration>` (e.g. `30s`, `10m`); set to
+  `0` / `off` / `false` to disable the ticker (root watch still fires).
+  Discovered projects emit a `[discovered] <path>` log line and get the
+  same one-shot `BaselineScan` used at startup, so the pre-check is
+  accurate on the first `cd` into the new repo.
+- `watcher.Watcher` gained `WatchRoot(root string) error` and a
+  `RootCreates <-chan string` that emits absolute paths of new, non-hidden
+  direct children of registered roots. `bootstrap.ScanOne(store, matcher,
+  root)` is the reusable per-root walker extracted out of `Scan` so both
+  the startup path and the runtime-discovery path go through identical
+  three-layer exclusion (hidden/skipDirs → matcher → classifier+store).
 - `pdmcguard doctor` one-shot health check. Runs eleven read-only checks
   across install state (config dir, installed binary, PATH resolution,
   system service, shell hook block integrity), auth (credentials file),
