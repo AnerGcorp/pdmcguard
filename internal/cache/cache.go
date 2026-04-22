@@ -8,6 +8,7 @@ package cache
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -135,12 +136,32 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// canonProjectDir normalizes a project path for stable keying: resolve
+// symlinks (best-effort) then lexically clean. Falls back to Clean on
+// resolution failure so paths for removed projects still match what was
+// inserted. Empty string passes through unchanged.
+//
+// Without this, /tmp/foo, /tmp/foo/, and /private/tmp/foo (the macOS
+// symlink-resolved form) all keyed as distinct rows under the composite
+// PRIMARY KEY, allowing the same logical project to accumulate duplicate
+// alerts — a real bug observed during Stage 1 verification.
+func canonProjectDir(p string) string {
+	if p == "" {
+		return p
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return filepath.Clean(p)
+}
+
 // CriticalAlerts returns critical-severity alerts for a project directory
 // that have not been shown in a terminal within the quiet window (24h).
 // Once MarkShown has been called for the project, subsequent calls return
 // an empty slice until the window elapses — this is what stops the shell
 // hook from re-printing the same banner every prompt.
 func (s *Store) CriticalAlerts(projectDir string) ([]Alert, error) {
+	projectDir = canonProjectDir(projectDir)
 	cutoff := time.Now().UTC().Add(-QuietWindow).Format(time.RFC3339)
 	rows, err := s.db.Query(
 		`SELECT advisory_id, package_name, ecosystem, severity, summary
@@ -171,6 +192,7 @@ func (s *Store) CriticalAlerts(projectDir string) ([]Alert, error) {
 // Call this after successfully printing the shell-hook warning to start the
 // 24h quiet window (see CriticalAlerts).
 func (s *Store) MarkShown(projectDir string) error {
+	projectDir = canonProjectDir(projectDir)
 	_, err := s.db.Exec(
 		`UPDATE project_alerts
 		 SET last_shown_at = ?
@@ -200,6 +222,7 @@ func (s *Store) HasAnyCritical() (bool, error) {
 // preserved across re-syncs — otherwise every advisory pull would reset the
 // quiet window and the shell hook would re-print on the next prompt.
 func (s *Store) UpsertProjectAlert(pa ProjectAlert) error {
+	pa.ProjectDir = canonProjectDir(pa.ProjectDir)
 	_, err := s.db.Exec(
 		`INSERT INTO project_alerts
 		   (project_dir, advisory_id, package_name, ecosystem, severity, summary, updated_at)
@@ -218,6 +241,7 @@ func (s *Store) UpsertProjectAlert(pa ProjectAlert) error {
 
 // ClearProjectAlerts removes all alerts for a project directory.
 func (s *Store) ClearProjectAlerts(projectDir string) error {
+	projectDir = canonProjectDir(projectDir)
 	_, err := s.db.Exec(`DELETE FROM project_alerts WHERE project_dir = ?`, projectDir)
 	return err
 }

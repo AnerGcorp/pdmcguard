@@ -26,6 +26,11 @@ const maxDepth = 50
 // (npm global install, dotfile repo, an old download) — causes every
 // freshly-opened terminal to match $HOME as "the project" and spam the
 // shell-hook banner before the user has even cd'd anywhere.
+//
+// The returned path is canonicalized (symlinks resolved + Clean) so
+// downstream cache keys are stable regardless of whether the caller passed
+// the symlinked form (shell hook via os.Getwd) or the resolved form
+// (watcher).
 func FindProjectDir(startDir string) (string, error) {
 	home := os.Getenv("HOME")
 	dir := startDir
@@ -42,7 +47,7 @@ func FindProjectDir(startDir string) (string, error) {
 		}
 		for _, e := range entries {
 			if !e.IsDir() && watcher.IsPDMC(e.Name()) {
-				return dir, nil
+				return canonPath(dir), nil
 			}
 		}
 		parent := filepath.Dir(dir)
@@ -52,4 +57,17 @@ func FindProjectDir(startDir string) (string, error) {
 		dir = parent
 	}
 	return "", ErrNoProject
+}
+
+// canonPath resolves symlinks (best-effort) and lexically cleans the path.
+// Mirrors internal/cache.canonProjectDir — kept as a small duplicate rather
+// than introducing a cross-package dependency for a trivial helper.
+func canonPath(p string) string {
+	if p == "" {
+		return p
+	}
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		p = resolved
+	}
+	return filepath.Clean(p)
 }

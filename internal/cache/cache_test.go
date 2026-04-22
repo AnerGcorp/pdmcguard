@@ -6,6 +6,7 @@ package cache
 
 import (
 	"database/sql"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -297,6 +298,125 @@ func TestHasAnyCritical(t *testing.T) {
 	})
 	if any, _ = store.HasAnyCritical(); any {
 		t.Error("expected false when only non-critical rows remain")
+	}
+}
+
+// TestUpsert_CanonicalizesTrailingSlash guards the composite PRIMARY KEY
+// against trailing-slash drift. Without canonicalization, "/tmp/foo/" and
+// "/tmp/foo" would key as distinct rows and the same logical project could
+// accumulate duplicate alerts — a real bug observed during Stage 1 verify.
+func TestUpsert_CanonicalizesTrailingSlash(t *testing.T) {
+	store := openTestStore(t)
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base := ProjectAlert{
+		AdvisoryID:  "GHSA-SLASH",
+		PackageName: "pkg",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "first",
+	}
+
+	// Upsert once with a trailing slash, then with the clean form.
+	withSlash := base
+	withSlash.ProjectDir = dir + "/"
+	if err := store.UpsertProjectAlert(withSlash); err != nil {
+		t.Fatal(err)
+	}
+
+	clean := base
+	clean.ProjectDir = dir
+	clean.Summary = "second"
+	if err := store.UpsertProjectAlert(clean); err != nil {
+		t.Fatal(err)
+	}
+
+	// Count rows directly — CriticalAlerts also canonicalizes, which would
+	// hide the duplicate. Hit the table directly.
+	var n int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM project_alerts WHERE advisory_id = ?`,
+		"GHSA-SLASH",
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected 1 row after slash/no-slash upserts, got %d", n)
+	}
+
+	// The second upsert should have won (upsert semantics).
+	alerts, _ := store.CriticalAlerts(dir)
+	if len(alerts) != 1 || alerts[0].Summary != "second" {
+		t.Errorf("expected summary 'second', got %+v", alerts)
+	}
+}
+
+// TestUpsert_CanonicalizesSymlink covers the daemon-vs-shell-hook case:
+// the watcher sees the symlink-resolved path while the shell hook reports
+// the symlinked path from os.Getwd. Without canonicalization those rows
+// diverge and CriticalAlerts misses half of them.
+func TestUpsert_CanonicalizesSymlink(t *testing.T) {
+	store := openTestStore(t)
+	tmp, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	realDir := filepath.Join(tmp, "real")
+	linkDir := filepath.Join(tmp, "link")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Upsert via the symlinked path.
+	if err := store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir:  linkDir,
+		AdvisoryID:  "GHSA-SYM",
+		PackageName: "pkg",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "sym",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Query via the resolved path — should see the same row.
+	alerts, err := store.CriticalAlerts(realDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 1 {
+		t.Fatalf("expected 1 alert when querying resolved path, got %d", len(alerts))
+	}
+	if alerts[0].AdvisoryID != "GHSA-SYM" {
+		t.Errorf("unexpected advisory id: %q", alerts[0].AdvisoryID)
+	}
+
+	// Second upsert via the resolved path must not create a duplicate row.
+	if err := store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir:  realDir,
+		AdvisoryID:  "GHSA-SYM",
+		PackageName: "pkg",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "sym2",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM project_alerts WHERE advisory_id = ?`,
+		"GHSA-SYM",
+	).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("expected single canonical row, got %d", n)
 	}
 }
 

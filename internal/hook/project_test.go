@@ -11,8 +11,20 @@ import (
 	"testing"
 )
 
+// resolveTempDir returns t.TempDir() with symlinks resolved. FindProjectDir
+// canonicalizes its return value, so on macOS (/var → /private/var) a raw
+// comparison against t.TempDir() would spuriously fail.
+func resolveTempDir(t *testing.T) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
 func TestFindProjectDir_GoMod(t *testing.T) {
-	root := t.TempDir()
+	root := resolveTempDir(t)
 	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module test"), 0o644)
 
 	dir, err := FindProjectDir(root)
@@ -25,7 +37,7 @@ func TestFindProjectDir_GoMod(t *testing.T) {
 }
 
 func TestFindProjectDir_PackageJSON(t *testing.T) {
-	root := t.TempDir()
+	root := resolveTempDir(t)
 	os.WriteFile(filepath.Join(root, "package.json"), []byte("{}"), 0o644)
 
 	dir, err := FindProjectDir(root)
@@ -38,7 +50,7 @@ func TestFindProjectDir_PackageJSON(t *testing.T) {
 }
 
 func TestFindProjectDir_WalksUp(t *testing.T) {
-	root := t.TempDir()
+	root := resolveTempDir(t)
 	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module test"), 0o644)
 
 	sub := filepath.Join(root, "cmd", "app")
@@ -54,7 +66,7 @@ func TestFindProjectDir_WalksUp(t *testing.T) {
 }
 
 func TestFindProjectDir_NestedProject(t *testing.T) {
-	root := t.TempDir()
+	root := resolveTempDir(t)
 	os.WriteFile(filepath.Join(root, "go.mod"), []byte("module parent"), 0o644)
 
 	inner := filepath.Join(root, "services", "api")
@@ -107,7 +119,7 @@ func TestFindProjectDir_StopsAtHome(t *testing.T) {
 // TestFindProjectDir_MatchesProjectUnderHome ensures the $HOME bailout
 // does not break the common case of a real project beneath $HOME.
 func TestFindProjectDir_MatchesProjectUnderHome(t *testing.T) {
-	home := t.TempDir()
+	home := resolveTempDir(t)
 	t.Setenv("HOME", home)
 
 	proj := filepath.Join(home, "code", "myapp")
@@ -125,5 +137,31 @@ func TestFindProjectDir_MatchesProjectUnderHome(t *testing.T) {
 	}
 	if dir != proj {
 		t.Errorf("expected %s, got %s", proj, dir)
+	}
+}
+
+// TestFindProjectDir_ReturnsCanonical covers the daemon-vs-shell-hook path
+// divergence: os.Getwd from the shell hook yields the symlinked form, while
+// the watcher and cache already use the resolved form. FindProjectDir must
+// return the resolved form so cache keys line up across both callers.
+func TestFindProjectDir_ReturnsCanonical(t *testing.T) {
+	tmp := resolveTempDir(t)
+	realDir := filepath.Join(tmp, "real")
+	linkDir := filepath.Join(tmp, "link")
+	if err := os.Mkdir(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(realDir, "go.mod"), []byte("module r"), 0o644)
+	if err := os.Symlink(realDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// Caller passes the symlink; FindProjectDir should resolve it.
+	dir, err := FindProjectDir(linkDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir != realDir {
+		t.Errorf("expected canonical %s, got %s", realDir, dir)
 	}
 }
