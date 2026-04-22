@@ -263,3 +263,45 @@ func TestBaselineScan_OfflineEnqueuesWithoutMeta(t *testing.T) {
 		t.Errorf("queue depth = %d, want 1 (offline run should enqueue)", n)
 	}
 }
+
+// TestBaselineScan_ReconcilesSentinel guards the post-baseline
+// updateAlertSentinel call. Scenario: a critical alert exists in the
+// DB (e.g. left over from a previous online session) but the sentinel
+// flag file is missing (manual deletion, ~/.pdmcguard recreated, etc.).
+// Without the reconcile, the shell hook stat()s a missing flag and
+// short-circuits silently — which is exactly the bug that surfaced
+// during manual E2E of Stage 3.
+func TestBaselineScan_ReconcilesSentinel(t *testing.T) {
+	// Redirect config.Dir() away from the real ~/.pdmcguard.
+	t.Setenv("HOME", t.TempDir())
+
+	e := newTestEngine(t)
+
+	// Pre-seed a critical alert directly in the DB — simulates leftover
+	// state from a previous online run.
+	if err := e.cache.UpsertProjectAlert(cache.ProjectAlert{
+		ProjectDir:  "/tmp/somewhere",
+		AdvisoryID:  "TEST-CRITICAL",
+		PackageName: "demo",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "reconcile probe",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sentinel must not exist before baseline — that's the bug state.
+	sentinel := AlertSentinelFile()
+	if _, err := os.Stat(sentinel); !os.IsNotExist(err) {
+		t.Fatalf("sentinel should be absent before baseline; stat err=%v", err)
+	}
+
+	// Run baseline with no dirs — enumeration yields zero events, so the
+	// reconcile runs without touching HandleChange at all. Proves the
+	// sentinel update is unconditional post-loop, not a side effect.
+	e.BaselineScan(nil, nil)
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Errorf("sentinel not written after BaselineScan: %v", err)
+	}
+}

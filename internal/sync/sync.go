@@ -144,6 +144,16 @@ func (e *Engine) BaselineScan(dirs []string, gitReader *git.Reader) BaselineStat
 			stats.Skipped++
 		}
 	}
+
+	// Reconcile the shell-hook sentinel against actual DB state. The
+	// sentinel (~/.pdmcguard/alerts.flag) is normally written/removed by
+	// syncProject's online classifier path — but offline baseline, manual
+	// sentinel deletion, or a fresh daemon on a machine with pre-seeded
+	// alerts all leave the two out of sync. updateAlertSentinel is a pure
+	// function of cache.HasAnyCritical(), so calling it once here makes
+	// the on-disk flag match reality regardless of how we got here.
+	e.updateAlertSentinel()
+
 	return stats
 }
 
