@@ -456,13 +456,18 @@ func AlertSentinelFile() string {
 	return config.FilePath("alerts.flag")
 }
 
-// updateAlertSentinel writes or removes ~/.pdmcguard/alerts.flag so the
+// ReconcileAlertSentinel writes or removes ~/.pdmcguard/alerts.flag so the
 // shell hook can decide without forking whether there is anything worth
 // re-checking. Errors are swallowed — a missing or stale sentinel only
 // costs one redundant binary invocation; it cannot produce false alerts.
-func (e *Engine) updateAlertSentinel() {
+//
+// Exposed at package level (rather than as an Engine method) so the ack
+// CLI can tick the sentinel after recording an ack without having to
+// stand up a full Engine (which would open the queue DB and start the
+// reconnect loop for what's effectively a one-shot mutation).
+func ReconcileAlertSentinel(store *cache.Store) {
 	path := AlertSentinelFile()
-	hasAny, err := e.cache.HasAnyCritical()
+	hasAny, err := store.HasAnyCritical()
 	if err != nil {
 		return
 	}
@@ -471,6 +476,13 @@ func (e *Engine) updateAlertSentinel() {
 		return
 	}
 	_ = os.Remove(path)
+}
+
+// updateAlertSentinel is the Engine-bound wrapper, kept so callers inside
+// this package that already hold the Engine don't need to reach for its
+// cache field.
+func (e *Engine) updateAlertSentinel() {
+	ReconcileAlertSentinel(e.cache)
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

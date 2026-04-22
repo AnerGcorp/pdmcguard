@@ -78,6 +78,14 @@ func main() {
 			cmdHookInit(filteredArgs[1:])
 			return
 
+		case "ack":
+			cmdAck(filteredArgs[1:])
+			return
+
+		case "unack":
+			cmdUnack(filteredArgs[1:])
+			return
+
 		case "help", "--help", "-h":
 			printUsage()
 			return
@@ -278,6 +286,8 @@ Usage:
   pdmcguard status          Show daemon status, sync mode, and queue depth
   pdmcguard pre-check       Check current project for critical advisories (used by shell hook)
   pdmcguard hook-init       Output shell hook snippet (eval "$(pdmcguard hook-init)")
+  pdmcguard ack <id>        Permanently dismiss an advisory (--all-projects for global, --list to show)
+  pdmcguard unack <id>      Reverse a prior ack (--all-projects for global)
   pdmcguard version         Print version information
 
 Flags:

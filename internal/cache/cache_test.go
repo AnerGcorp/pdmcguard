@@ -420,6 +420,141 @@ func TestUpsert_CanonicalizesSymlink(t *testing.T) {
 	}
 }
 
+// TestAck_SurvivesClearAndUpsert is the headline guarantee of the
+// project_acks design: an ack must persist across the ClearProjectAlerts +
+// UpsertProjectAlert re-sync cycle the daemon runs on every classify. If
+// the ack state lived on the project_alerts row it would be wiped; a
+// separate table means the user's "stop telling me about this" decision
+// survives every future re-sync.
+func TestAck_SurvivesClearAndUpsert(t *testing.T) {
+	store := openTestStore(t)
+
+	pa := ProjectAlert{
+		ProjectDir:  "/proj",
+		AdvisoryID:  "GHSA-ACK1",
+		PackageName: "lodash",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+		Summary:     "stays acked across sync",
+	}
+	if err := store.UpsertProjectAlert(pa); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ack("/proj", "GHSA-ACK1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a fresh classifier roundtrip: wipe + re-insert.
+	if err := store.ClearProjectAlerts("/proj"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertProjectAlert(pa); err != nil {
+		t.Fatal(err)
+	}
+
+	alerts, err := store.CriticalAlerts("/proj")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(alerts) != 0 {
+		t.Fatalf("expected ack to survive re-sync, got %d alerts: %+v", len(alerts), alerts)
+	}
+}
+
+// TestAck_PerProjectScope verifies the default ack scope is the single
+// project, not the advisory globally. Acking lodash in project A must not
+// hide the same advisory in project B.
+func TestAck_PerProjectScope(t *testing.T) {
+	store := openTestStore(t)
+
+	for _, dir := range []string{"/proj/a", "/proj/b"} {
+		store.UpsertProjectAlert(ProjectAlert{
+			ProjectDir:  dir,
+			AdvisoryID:  "GHSA-SCOPE",
+			PackageName: "lodash",
+			Ecosystem:   "npm",
+			Severity:    "critical",
+		})
+	}
+
+	if err := store.Ack("/proj/a", "GHSA-SCOPE"); err != nil {
+		t.Fatal(err)
+	}
+
+	aAlerts, _ := store.CriticalAlerts("/proj/a")
+	if len(aAlerts) != 0 {
+		t.Errorf("expected ack to suppress alert in project A, got %d", len(aAlerts))
+	}
+
+	bAlerts, _ := store.CriticalAlerts("/proj/b")
+	if len(bAlerts) != 1 {
+		t.Errorf("expected project B to still see alert, got %d", len(bAlerts))
+	}
+}
+
+// TestAckGlobal_FiltersEverywhere exercises the "*" wildcard sentinel used
+// by --all-projects. A global ack must hide the advisory from every
+// project's CriticalAlerts response.
+func TestAckGlobal_FiltersEverywhere(t *testing.T) {
+	store := openTestStore(t)
+
+	for _, dir := range []string{"/a", "/b", "/c"} {
+		store.UpsertProjectAlert(ProjectAlert{
+			ProjectDir:  dir,
+			AdvisoryID:  "GHSA-GLOBAL",
+			PackageName: "lodash",
+			Ecosystem:   "npm",
+			Severity:    "critical",
+		})
+	}
+
+	if err := store.Ack(GlobalAckScope, "GHSA-GLOBAL"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dir := range []string{"/a", "/b", "/c"} {
+		alerts, _ := store.CriticalAlerts(dir)
+		if len(alerts) != 0 {
+			t.Errorf("expected global ack to hide alert in %s, got %d", dir, len(alerts))
+		}
+	}
+}
+
+// TestHasAnyCritical_IgnoresAcked closes the sentinel-file corner: if every
+// critical alert on the machine is acked, HasAnyCritical must return false
+// so the shell hook's stat() on alerts.flag keeps the machine silent
+// without ever forking the Go binary.
+func TestHasAnyCritical_IgnoresAcked(t *testing.T) {
+	store := openTestStore(t)
+
+	store.UpsertProjectAlert(ProjectAlert{
+		ProjectDir:  "/proj",
+		AdvisoryID:  "GHSA-SENTINEL",
+		PackageName: "lodash",
+		Ecosystem:   "npm",
+		Severity:    "critical",
+	})
+
+	any, err := store.HasAnyCritical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !any {
+		t.Fatal("expected true with one critical alert and no acks")
+	}
+
+	if err := store.Ack("/proj", "GHSA-SENTINEL"); err != nil {
+		t.Fatal(err)
+	}
+	any, err = store.HasAnyCritical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if any {
+		t.Error("expected false when the only critical alert is acked")
+	}
+}
+
 // TestMigration_LastShownAtColumnAdded opens a DB created under the old
 // schema (no last_shown_at column) and verifies that Open() applies the
 // additive migration without touching existing rows.

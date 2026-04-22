@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS cache_meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS project_acks (
+	project_dir  TEXT NOT NULL,
+	advisory_id  TEXT NOT NULL,
+	acked_at     TEXT NOT NULL,
+	PRIMARY KEY (project_dir, advisory_id)
+);
 `
 
 const cachePragmas = `
@@ -169,6 +176,12 @@ func (s *Store) CriticalAlerts(projectDir string) ([]Alert, error) {
 		 WHERE project_dir = ?
 		   AND severity = 'critical'
 		   AND (last_shown_at = '' OR last_shown_at < ?)
+		   AND NOT EXISTS (
+		     SELECT 1 FROM project_acks
+		     WHERE project_acks.advisory_id = project_alerts.advisory_id
+		       AND (project_acks.project_dir = project_alerts.project_dir
+		            OR project_acks.project_dir = '*')
+		   )
 		 ORDER BY package_name`,
 		projectDir, cutoff,
 	)
@@ -203,18 +216,35 @@ func (s *Store) MarkShown(projectDir string) error {
 }
 
 // HasAnyCritical reports whether any critical alert exists anywhere in the
-// cache, across all projects. The sync engine uses this to maintain a
-// zero-cost sentinel file (alerts.flag) that the shell hook can stat() to
-// avoid forking the Go binary when there's nothing to show on the machine.
+// cache, across all projects, that is NOT suppressed by a project- or
+// global-scoped ack. The sync engine uses this to maintain a zero-cost
+// sentinel file (alerts.flag) that the shell hook can stat() to avoid
+// forking the Go binary when there's nothing to show on the machine — so
+// a fully-acked machine clears the flag and goes silent without ever
+// invoking the ack filter at banner time.
+//
+// Uses EXISTS + LIMIT 1 (via SELECT 1 ... LIMIT 1) rather than COUNT(*)
+// so a machine with 10k acked rows stops at the first un-acked hit.
 func (s *Store) HasAnyCritical() (bool, error) {
-	var n int
+	var one int
 	err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM project_alerts WHERE severity = 'critical'`,
-	).Scan(&n)
+		`SELECT 1 FROM project_alerts
+		 WHERE severity = 'critical'
+		   AND NOT EXISTS (
+		     SELECT 1 FROM project_acks
+		     WHERE project_acks.advisory_id = project_alerts.advisory_id
+		       AND (project_acks.project_dir = project_alerts.project_dir
+		            OR project_acks.project_dir = '*')
+		   )
+		 LIMIT 1`,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	return n > 0, nil
+	return true, nil
 }
 
 // UpsertProjectAlert inserts a new project alert or updates an existing one.
@@ -244,6 +274,111 @@ func (s *Store) ClearProjectAlerts(projectDir string) error {
 	projectDir = canonProjectDir(projectDir)
 	_, err := s.db.Exec(`DELETE FROM project_alerts WHERE project_dir = ?`, projectDir)
 	return err
+}
+
+// GlobalAckScope is the sentinel project_dir value for acks that apply
+// everywhere. Callers wanting a global ack pass this explicitly — we reject
+// empty strings to avoid a cwd-inherited "" accidentally becoming global.
+const GlobalAckScope = "*"
+
+// Ack represents a permanent dismissal of an advisory at a given scope.
+type Ack struct {
+	ProjectDir string // "*" for global
+	AdvisoryID string
+	AckedAt    time.Time
+}
+
+// Ack records a permanent dismissal for (projectDir, advisoryID). If
+// projectDir is GlobalAckScope ("*") the ack applies across every project;
+// otherwise it is scoped to the canonicalized project path. Empty
+// projectDir is rejected to prevent accidental global acks from callers
+// that forgot to resolve cwd.
+//
+// Lives on its own table (project_acks) rather than a column of
+// project_alerts because syncProject wipes project_alerts rows via
+// ClearProjectAlerts on every re-sync — a column would be deleted with
+// the row. The separate table survives re-classification cycles.
+func (s *Store) Ack(projectDir, advisoryID string) error {
+	if projectDir == "" {
+		return fmt.Errorf("ack: projectDir must be non-empty (use GlobalAckScope for global)")
+	}
+	if advisoryID == "" {
+		return fmt.Errorf("ack: advisoryID must be non-empty")
+	}
+	if projectDir != GlobalAckScope {
+		projectDir = canonProjectDir(projectDir)
+	}
+	_, err := s.db.Exec(
+		`INSERT INTO project_acks (project_dir, advisory_id, acked_at)
+		 VALUES (?, ?, ?)
+		 ON CONFLICT(project_dir, advisory_id) DO UPDATE SET
+		   acked_at = excluded.acked_at`,
+		projectDir, advisoryID, time.Now().UTC().Format(time.RFC3339),
+	)
+	return err
+}
+
+// Unack removes a previously-recorded ack. No-op if the row does not exist.
+// projectDir is canonicalized the same way as Ack — callers pass
+// GlobalAckScope for a global unack.
+func (s *Store) Unack(projectDir, advisoryID string) error {
+	if projectDir == "" {
+		return fmt.Errorf("unack: projectDir must be non-empty (use GlobalAckScope for global)")
+	}
+	if projectDir != GlobalAckScope {
+		projectDir = canonProjectDir(projectDir)
+	}
+	_, err := s.db.Exec(
+		`DELETE FROM project_acks WHERE project_dir = ? AND advisory_id = ?`,
+		projectDir, advisoryID,
+	)
+	return err
+}
+
+// ListAcks returns every ack row, ordered by project_dir then advisory_id
+// for deterministic output. Used by `pdmcguard ack --list`.
+func (s *Store) ListAcks() ([]Ack, error) {
+	rows, err := s.db.Query(
+		`SELECT project_dir, advisory_id, acked_at
+		 FROM project_acks
+		 ORDER BY project_dir, advisory_id`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var acks []Ack
+	for rows.Next() {
+		var a Ack
+		var ackedAt string
+		if err := rows.Scan(&a.ProjectDir, &a.AdvisoryID, &ackedAt); err != nil {
+			return nil, err
+		}
+		if t, perr := time.Parse(time.RFC3339, ackedAt); perr == nil {
+			a.AckedAt = t
+		}
+		acks = append(acks, a)
+	}
+	return acks, rows.Err()
+}
+
+// AdvisoryIsActive reports whether advisoryID appears on any project_alerts
+// row. Used by the ack CLI to warn on probable typos without refusing the
+// ack — prophylactic acks are allowed.
+func (s *Store) AdvisoryIsActive(advisoryID string) (bool, error) {
+	var one int
+	err := s.db.QueryRow(
+		`SELECT 1 FROM project_alerts WHERE advisory_id = ? LIMIT 1`,
+		advisoryID,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // UpsertAdvisory inserts or replaces a full advisory record.
