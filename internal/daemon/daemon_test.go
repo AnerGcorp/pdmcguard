@@ -211,6 +211,140 @@ func TestShellHookLifecycle_PreservesUserContent(t *testing.T) {
 	}
 }
 
+// TestInjectHook_AddsPathExport is the headline guarantee of the
+// install-PATH-gap fix: the block InjectHook writes MUST put the binary's
+// directory on $PATH so `pdmcguard <subcommand>` resolves to the installed
+// binary rather than a stale global or "command not found".
+func TestInjectHook_AddsPathExport(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	binPath := "/opt/pdmcguard/bin/pdmcguard"
+
+	if err := InjectHook("zsh", binPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(rcPath)
+	content := string(data)
+
+	wantPath := `export PATH="/opt/pdmcguard/bin:$PATH"`
+	if !strings.Contains(content, wantPath) {
+		t.Errorf("expected PATH export %q, got:\n%s", wantPath, content)
+	}
+	// PATH line must come before the eval so the eval can resolve
+	// pdmcguard subcommands if they're referenced from hook-init output.
+	pathIdx := strings.Index(content, wantPath)
+	evalIdx := strings.Index(content, "eval \"$(")
+	if pathIdx < 0 || evalIdx < 0 || pathIdx > evalIdx {
+		t.Errorf("PATH export must precede eval line (pathIdx=%d, evalIdx=%d)", pathIdx, evalIdx)
+	}
+}
+
+// TestInjectHook_ReinstallUpgradesOldBlock is the v0.3.0 → v0.3.1 upgrade
+// regression test. Existing users have a no-PATH block in their rc file;
+// a plain reinstall used to short-circuit on "markers already present"
+// and silently leave them stuck. The fix rewrites the block every time,
+// so the PATH line lands on the next `pdmcguard install`.
+func TestInjectHook_ReinstallUpgradesOldBlock(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	binPath := "/fake/bin/pdmcguard"
+
+	// Seed the rc with the pre-fix block format (no PATH line) plus
+	// surrounding user content that must survive the upgrade.
+	oldBlock := "\n" + hookStartMarker + "\n" +
+		"eval \"$(" + binPath + " hook-init)\"\n" +
+		hookEndMarker + "\n"
+	seeded := "# my zshrc\nexport FOO=bar\n" + oldBlock + "alias g=git\n"
+	if err := os.WriteFile(rcPath, []byte(seeded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := InjectHook("zsh", binPath); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(rcPath)
+	content := string(data)
+
+	// Exactly one block — no duplicate from the reinstall.
+	if got := strings.Count(content, hookStartMarker); got != 1 {
+		t.Errorf("expected 1 block after reinstall, got %d:\n%s", got, content)
+	}
+	// The new PATH line is present.
+	if !strings.Contains(content, `export PATH="/fake/bin:$PATH"`) {
+		t.Errorf("reinstall did not add PATH line; content:\n%s", content)
+	}
+	// Surrounding user content survived.
+	if !strings.Contains(content, "export FOO=bar") {
+		t.Error("pre-block user content lost on reinstall")
+	}
+	if !strings.Contains(content, "alias g=git") {
+		t.Error("post-block user content lost on reinstall")
+	}
+}
+
+// TestInjectHook_FishUsesSetGx covers fish's non-POSIX PATH syntax. fish
+// doesn't have `export`, so the block must use `set -gx PATH "..." $PATH`
+// instead or the rc file fails to parse on the user's next shell start.
+func TestInjectHook_FishUsesSetGx(t *testing.T) {
+	rcPath := withFakeHome(t, "fish")
+
+	if err := InjectHook("fish", "/fake/bin/pdmcguard"); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(rcPath)
+	content := string(data)
+
+	wantPath := `set -gx PATH "/fake/bin" $PATH`
+	if !strings.Contains(content, wantPath) {
+		t.Errorf("expected fish PATH line %q, got:\n%s", wantPath, content)
+	}
+	if strings.Contains(content, "export PATH=") {
+		t.Error("fish block must not use bash/zsh 'export PATH=' syntax")
+	}
+}
+
+// TestInjectHook_PreservesSurroundingOnReinject is distinct from the full
+// lifecycle test: it verifies content preservation across a reinject
+// (strip + rewrite) without ever calling RemoveHook. This is the hot path
+// for every `pdmcguard install` from here on.
+func TestInjectHook_PreservesSurroundingOnReinject(t *testing.T) {
+	rcPath := withFakeHome(t, "zsh")
+	binPath := "/fake/bin/pdmcguard"
+
+	// First inject on a pre-populated rc.
+	seeded := "alias ll=\"ls -la\"\nexport FOO=bar\n"
+	if err := os.WriteFile(rcPath, []byte(seeded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := InjectHook("zsh", binPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Append more user content AFTER the block (simulating a user editing
+	// their rc between installs) and re-inject.
+	data, _ := os.ReadFile(rcPath)
+	trailing := "\nexport BAZ=qux\n"
+	if err := os.WriteFile(rcPath, append(data, []byte(trailing)...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := InjectHook("zsh", binPath); err != nil {
+		t.Fatal(err)
+	}
+
+	final, _ := os.ReadFile(rcPath)
+	content := string(final)
+
+	for _, want := range []string{"alias ll=\"ls -la\"", "export FOO=bar", "export BAZ=qux"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("reinject lost surrounding content %q; got:\n%s", want, content)
+		}
+	}
+	if got := strings.Count(content, hookStartMarker); got != 1 {
+		t.Errorf("expected 1 block, got %d", got)
+	}
+}
+
 func TestDetectShell(t *testing.T) {
 	t.Setenv("SHELL", "/bin/zsh")
 	if s := DetectShell(); s != "zsh" {
