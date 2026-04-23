@@ -9,6 +9,8 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-23
+
 ### Added
 - `pdmcguard start` / `pdmcguard stop` — activation verbs that work with or
   without a registered service. When the launchd/systemd unit is installed
