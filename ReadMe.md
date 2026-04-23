@@ -38,15 +38,19 @@ PDMCGuard fills this gap.
 
 ## How it works
 
-Install a single binary. Forget about it.
+Install a single binary, activate it once, forget about it.
 
 ```sh
 curl -sSL https://pdmcguard.com/install.sh | sh
+pdmcguard install    # register the service + inject the shell hook
+pdmcguard start      # start the daemon
 ```
 
-The daemon registers itself as a system service and runs silently in the
-background. It watches your project directories using native OS APIs and
-intercepts package manager commands via a shell hook — before they run.
+The daemon is registered as a launchd agent on macOS and a systemd user
+service on Linux. Once started, it runs silently in the background, survives
+reboots, and restarts itself on crash. It watches your project directories
+using native OS APIs and intercepts package manager commands via a shell
+hook — before they run.
 
 When a dependency file changes, or when you run `npm install`, `pip install`,
 or any recognised install command, PDMCGuard:
@@ -117,20 +121,46 @@ Download the binary for your platform from
 checksum, and place it in your PATH. Then run:
 
 ```sh
-pdmcguard install
+pdmcguard install && pdmcguard start
 ```
+
+`install` is configuration (copies the binary into `~/.pdmcguard/bin`, injects
+the shell hook, registers the service). `start` is activation. Split into two
+verbs because the original script already delivered the binary — running the
+daemon is a deliberate second step.
 
 ---
 
 ## CLI reference
 
+**Lifecycle:**
+
 ```sh
-pdmcguard install       # register system service + inject shell hook
-pdmcguard uninstall     # remove service + remove shell hook
-pdmcguard login         # authenticate with your PDMCGuard account
-pdmcguard status        # show daemon status, last sync, open alert count
-pdmcguard pre-check     # manually run pre-install check in current directory
-pdmcguard version       # print version info
+pdmcguard install               # copy binary, register service, inject shell hook
+pdmcguard start                 # start the daemon (via service, or detached spawn)
+pdmcguard stop                  # stop the daemon
+pdmcguard uninstall             # remove service + shell hook (--purge also wipes data)
+pdmcguard status                # service / daemon / sync / queue status at a glance
+pdmcguard doctor                # deep health check across install, cache, IPC, config
+pdmcguard version               # print version info
+```
+
+**Account + alerts:**
+
+```sh
+pdmcguard login                 # authenticate with the dashboard (offline mode also works)
+pdmcguard ack <advisory-id>     # dismiss an advisory (--all-projects for global; --list to show)
+pdmcguard unack <advisory-id>   # reverse a prior ack
+pdmcguard pre-check             # run the pre-install check in the current directory
+```
+
+**Project scope:**
+
+```sh
+pdmcguard track [path]          # register a project with the running daemon (default: cwd)
+pdmcguard untrack <path>        # alias for `exclude` — stop tracking a path
+pdmcguard exclude <path>        # skip a path or basename from scans (--list to show rules)
+pdmcguard unexclude <path>      # remove a previously-added exclusion rule
 ```
 
 ---
